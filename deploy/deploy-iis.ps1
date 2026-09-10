@@ -110,10 +110,21 @@ Push-Location (Join-Path $RepoRoot 'client')
 try {
     & npm install
     if ($LASTEXITCODE -ne 0) { throw "npm install (client) failed" }
-    $env:VITE_API_URL = ''
-    & npm run build
-    if ($LASTEXITCODE -ne 0) { throw "npm run build (client) failed" }
-    Remove-Item Env:\VITE_API_URL -ErrorAction SilentlyContinue
+    # NOT $env:VITE_API_URL = '' -- on Windows, setting an environment
+    # variable to an empty string actually DELETES it (SetEnvironmentVariable
+    # with an empty value removes the variable; Windows has no concept of a
+    # zero-length env var), so vite build would never see it as set at all
+    # and would silently fall back to the http://<host>:4100 dev default.
+    # A .env file doesn't go through the OS environment at all -- Vite
+    # parses it directly -- so an explicitly-empty value works correctly.
+    $envLocalFile = '.env.production.local'
+    'VITE_API_URL=' | Set-Content -Encoding UTF8 $envLocalFile
+    try {
+        & npm run build
+        if ($LASTEXITCODE -ne 0) { throw "npm run build (client) failed" }
+    } finally {
+        Remove-Item $envLocalFile -ErrorAction SilentlyContinue
+    }
 } finally {
     Pop-Location
 }
