@@ -117,8 +117,14 @@ try {
     # and would silently fall back to the http://<host>:4100 dev default.
     # A .env file doesn't go through the OS environment at all -- Vite
     # parses it directly -- so an explicitly-empty value works correctly.
-    $envLocalFile = '.env.production.local'
-    'VITE_API_URL=' | Set-Content -Encoding UTF8 $envLocalFile
+    # Set-Content -Encoding UTF8 writes a BOM in Windows PowerShell 5.1
+    # (unlike PowerShell 7), which lands at the very start of the file --
+    # right before "VITE_API_URL" on line 1, and Vite's dotenv parser
+    # doesn't strip it, so the key fails to match -- silently reproducing
+    # the exact same :4100 fallback bug this file exists to avoid.
+    # WriteAllText with an explicit no-BOM encoding sidesteps the issue.
+    $envLocalFile = Join-Path (Get-Location) '.env.production.local'
+    [System.IO.File]::WriteAllText($envLocalFile, "VITE_API_URL=`n", (New-Object System.Text.UTF8Encoding $false))
     try {
         & npm run build
         if ($LASTEXITCODE -ne 0) { throw "npm run build (client) failed" }
