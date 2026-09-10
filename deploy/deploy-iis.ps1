@@ -66,6 +66,23 @@ if (-not (Test-Path (Join-Path $RepoRoot 'server\.env'))) {
     throw "server\.env is missing at $RepoRoot  -  copy it from deploy\migrate-data.ps1's output, or fill in server\.env.production.example and save it as server\.env, before running this script."
 }
 
+# --- Stop the backend first (if it's running from a previous deploy) -------
+# Windows locks a running process's files (in particular the Prisma query
+# engine's .dll.node) -- overwriting dist\ while the old build is still
+# running fails with EPIPE/EBUSY. Stop it now, start it fresh at the end.
+
+$existingSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($existingSvc -and $existingSvc.Status -ne 'Stopped') {
+    Write-Step "Stopping '$ServiceName' so the build can overwrite its files"
+    & $NssmExe stop $ServiceName | Out-Null
+    try {
+        $existingSvc.WaitForStatus('Stopped', (New-TimeSpan -Seconds 30))
+        Write-Ok "Stopped"
+    } catch {
+        throw "'$ServiceName' did not stop within 30s -- stop it manually (nssm stop $ServiceName) and re-run."
+    }
+}
+
 # --- Build the server ---------------------------------------------------
 
 Write-Step "Building server"
@@ -127,14 +144,8 @@ if (-not $svc) {
 & $NssmExe set $ServiceName AppRotateFiles 1
 & $NssmExe set $ServiceName Start SERVICE_AUTO_START
 
-$svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($svc -and $svc.Status -eq 'Running') {
-    Write-Step "Restarting service to pick up the new build"
-    & $NssmExe restart $ServiceName
-} else {
-    Write-Step "Starting service"
-    & $NssmExe start $ServiceName
-}
+Write-Step "Starting service"
+& $NssmExe start $ServiceName
 Write-Ok "Service '$ServiceName' running on port $BackendPort"
 
 # --- IIS site ---------------------------------------------------------------
