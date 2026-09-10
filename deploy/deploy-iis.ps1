@@ -142,16 +142,22 @@ Write-Ok "Service '$ServiceName' running on port $BackendPort"
 Write-Step "Creating/updating IIS site '$SiteName'"
 Import-Module WebAdministration
 
+# Bound to "*" (all interfaces) explicitly -- some IIS setups default a new
+# site to the machine's primary IP instead of wildcard when -IPAddress is
+# left unspecified, which then rejects localhost/127.0.0.1 requests with a
+# confusing "400 - Invalid Hostname" (the binding's IP doesn't match the
+# interface the request came in on).
+$desiredBinding = "*:${FrontendPort}:"
 $clientDist = Join-Path $RepoRoot 'client\dist'
 if (-not (Get-Website -Name $SiteName -ErrorAction SilentlyContinue)) {
-    New-Website -Name $SiteName -PhysicalPath $clientDist -Port $FrontendPort | Out-Null
+    New-Website -Name $SiteName -PhysicalPath $clientDist -Port $FrontendPort -IPAddress '*' | Out-Null
     Write-Ok "Site created"
 } else {
     Set-ItemProperty "IIS:\Sites\$SiteName" -Name physicalPath -Value $clientDist
     $binding = Get-WebBinding -Name $SiteName | Select-Object -First 1
-    if ($binding -and ($binding.bindingInformation -notmatch ":${FrontendPort}:")) {
-        Remove-WebBinding -Name $SiteName
-        New-WebBinding -Name $SiteName -Port $FrontendPort -Protocol http
+    if (-not $binding -or $binding.bindingInformation -ne $desiredBinding) {
+        Get-WebBinding -Name $SiteName | Remove-WebBinding
+        New-WebBinding -Name $SiteName -IPAddress '*' -Port $FrontendPort -Protocol http
     }
     Write-Ok "Site already existed  -  path/binding updated"
 }
