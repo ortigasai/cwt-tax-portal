@@ -1,0 +1,179 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// One row per contract number uploaded by the user. Holds the fields
+// extracted/entered from Customer Ledger, CTS, and manual sources.
+// Fields sourced from bulk imports (OCLP 1606, RPT towers) live in their
+// own tables and are joined in at read time by contractNumber.
+model Contract {
+  id                  String   @id @default(cuid())
+  contractNumber      String   @unique
+
+  // Upload batch reference — the sequential contract-list upload that first
+  // created this contract, so users can tell which batch to download.
+  batchNumber         Int?
+  batchDate           DateTime?
+
+  // Customer Ledger fields (Section 4)
+  buyerName           String?
+  estate              String?
+  tower               String?
+  unit                String?
+  totalTCP             Decimal? @db.Decimal(18, 2)
+  netTCP              Decimal? @db.Decimal(18, 2)
+
+  // CTS fields (Section 4) — manual entry; PDF kept for reference only.
+  // A single Contract to Sell commonly bundles a unit, a storage room, and a
+  // parking slot as three separately-valued line items — each tracked here.
+  ctsNotaryDate       DateTime?
+  sqmUnit             Decimal? @db.Decimal(10, 2)
+  sqmParking          Decimal? @db.Decimal(10, 2)
+  sqmStorage          Decimal? @db.Decimal(10, 2)
+  ctsFileName         String?
+  customerLedgerFileName String?
+
+  // Zonal value — manual entry, or auto-filled via the BIR zonal-value
+  // lookup (see zonalValueLookup.ts). Parking has its own rate (typically
+  // ~70% of the unit rate, per BIR's own schedule note); storage has NO
+  // separate rate — per the tax team, a storage room always carries the
+  // same zonal rate as the unit itself (BIR classifies both under the same
+  // RC/CC row), so computation.ts reuses zonalValuePerSqmUnit for storage.
+  zonalValuePerSqmUnit    Decimal? @map("zonalValuePerSqm") @db.Decimal(18, 2)
+  zonalValuePerSqmParking Decimal? @db.Decimal(18, 2)
+
+  // FMV match against RptTowerRecord — matched manually via search in UI.
+  // Separate matches per classification since each can have its own
+  // RPT_ALL TOWERS / tax declaration entry.
+  matchedRptRecordId        String?
+  matchedRptRecord          RptTowerRecord? @relation("UnitFmvMatch", fields: [matchedRptRecordId], references: [id])
+  matchedParkingRptRecordId String?
+  matchedParkingRptRecord   RptTowerRecord? @relation("ParkingFmvMatch", fields: [matchedParkingRptRecordId], references: [id])
+  matchedStorageRptRecordId String?
+  matchedStorageRptRecord   RptTowerRecord? @relation("StorageFmvMatch", fields: [matchedStorageRptRecordId], references: [id])
+
+  paymentRecords      PaymentRecord[]
+  collectionEvents    CwtCollectionEvent[]
+
+  notes               String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+// Individual payment-schedule line items parsed from a per-contract
+// Customer Ledger Excel file. Drives Sheet 1 of the exported ledger.
+model PaymentRecord {
+  id                String   @id @default(cuid())
+  contractId        String
+  contract          Contract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+
+  baselineDate      DateTime?
+  paymentDate       DateTime?
+  totalCollection   Decimal? @db.Decimal(18, 2)
+  clearingDocument  String?
+  orNumber          String?
+  paymentPrincipal  Decimal? @db.Decimal(18, 2)
+  paymentVat        Decimal? @db.Decimal(18, 2)
+  isSubtotal        Boolean  @default(false)
+
+  createdAt         DateTime @default(now())
+
+  @@index([contractId])
+}
+
+// One row per remittance line item parsed from the OCLP 1606 Summary
+// FINAL tab (a contract can have several rows for installment cases).
+// This is the source of truth for buyer classification, tax tagging,
+// and actual CWT remitted-to-date.
+model CwtCollectionEvent {
+  id                  String   @id @default(cuid())
+  contractId          String?
+  contract            Contract? @relation(fields: [contractId], references: [id], onDelete: SetNull)
+  contractNumberRaw   String
+  // Stable contract number this remittance lineage is anchored to, even
+  // when the unit's buyer (and contract number) changed mid-payment. Used
+  // to attribute remittances filed under a previous buyer's contract
+  // number to the current contract — see dataImport.ts.
+  baseContract        String?
+
+  buyerClassification String?
+  taxTagging          String?
+  sourceTaxBase       Decimal? @db.Decimal(18, 2)
+  sourceRate          Decimal? @db.Decimal(6, 4)
+  actualTaxDue        Decimal? @db.Decimal(18, 2)
+  transactionDate     DateTime?
+  datePaid            DateTime?
+  remarks             String?
+
+  createdAt           DateTime @default(now())
+
+  @@index([contractId])
+  @@index([contractNumberRaw])
+  @@index([baseContract])
+}
+
+// Static reference table loaded from RPT_ALL TOWERS.xlsx ("ALL" sheet).
+// Replaced wholesale on each new upload.
+model RptTowerRecord {
+  id                     String   @id @default(cuid())
+  tower                  String
+  type                   String?
+  floor                  String?
+  unit                   String
+  cct                    String?
+  taxDeclarationNumber   String?
+  fairMarketValue        Decimal  @db.Decimal(18, 2)
+  estate                 String?
+
+  matchedContracts        Contract[] @relation("UnitFmvMatch")
+  matchedParkingContracts Contract[] @relation("ParkingFmvMatch")
+  matchedStorageContracts Contract[] @relation("StorageFmvMatch")
+
+  @@index([tower, unit])
+}
+
+enum ImportType {
+  CONTRACT_LIST
+  CUSTOMER_LEDGER
+  OCLP_1606_SUMMARY
+  RPT_ALL_TOWERS
+}
+
+// Shadow copy of every manually-entered field (CTS notary date, SQM, zonal
+// values, FMV matches, notes), keyed by contractNumber rather than by the
+// Contract's own id. The folder sync deletes-and-recreates a Contract row
+// when its ledger file is untouched but the contract had been removed from
+// the system (see contracts.ts /delete) — that wipes any manual fields that
+// lived only on the Contract row. This table survives that cycle and is
+// re-applied onto the fresh stub the moment it's (re)created, so CTS/zonal
+// research is never lost. Written on every successful PATCH.
+model ContractManualOverride {
+  contractNumber            String    @id
+  ctsNotaryDate             DateTime?
+  sqmUnit                   Decimal?  @db.Decimal(10, 2)
+  sqmParking                Decimal?  @db.Decimal(10, 2)
+  sqmStorage                Decimal?  @db.Decimal(10, 2)
+  zonalValuePerSqmUnit      Decimal?  @db.Decimal(18, 2)
+  zonalValuePerSqmParking   Decimal?  @db.Decimal(18, 2)
+  matchedRptRecordId        String?
+  matchedParkingRptRecordId String?
+  matchedStorageRptRecordId String?
+  notes                     String?
+  updatedAt                 DateTime  @updatedAt
+}
+
+// Audit trail of bulk uploads for traceability.
+model ImportBatch {
+  id          String     @id @default(cuid())
+  type        ImportType
+  filename    String
+  rowCount    Int
+  batchNumber Int?       // sequential number for CONTRACT_LIST uploads
+  importedAt  DateTime   @default(now())
+}

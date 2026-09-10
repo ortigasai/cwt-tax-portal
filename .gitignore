@@ -1,0 +1,22 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+*.log
+.DS_Store
+server/src/generated/
+client/dist/
+coverage/
+
+# Personal Claude Code tool config for this checkout (paths/permissions
+# local to whoever's machine ran it) — not project source.
+.claude/
+
+# Local output of deploy/migrate-data.ps1 (Postgres dumps) — never committed.
+deploy/_migration-output/
+
+# Uploaded contract documents (customer ledgers, CTS files) — real business
+# data, not source code. Moved between machines via deploy/migrate-data.ps1
+# instead (ensureUploadsDir() recreates this folder on server startup).
+server/uploads/
