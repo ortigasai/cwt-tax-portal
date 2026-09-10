@@ -139,7 +139,8 @@ Write-Ok "Client built to client\dist"
 Write-Step "Writing web.config into client\dist"
 $webConfigTemplate = Join-Path $PSScriptRoot 'web.config'
 $webConfigOut = Join-Path $RepoRoot 'client\dist\web.config'
-(Get-Content $webConfigTemplate -Raw) -replace '__BACKEND_PORT__', $BackendPort | Set-Content -Encoding UTF8 $webConfigOut
+$webConfigContent = (Get-Content $webConfigTemplate -Raw) -replace '__BACKEND_PORT__', $BackendPort
+[System.IO.File]::WriteAllText($webConfigOut, $webConfigContent, (New-Object System.Text.UTF8Encoding $false))
 Write-Ok "web.config written (backend port $BackendPort)"
 
 # --- Backend service (NSSM) ------------------------------------------------
