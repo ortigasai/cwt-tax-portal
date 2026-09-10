@@ -20,9 +20,15 @@ installer/admin action on the server itself):
 
 ## First deploy
 
-1. **Get the code onto the server** at `C:\cwt-tax-portal` — either
-   `git clone https://github.com/ortigasai/cwt-tax-portal.git C:\cwt-tax-portal`
-   on the server, or copy the repo over some other way.
+1. **Get the code onto the server**, at `C:\cwt-tax-portal`. `deploy\pull-latest.ps1`
+   needs to exist there before it can run itself, so for the very first
+   deploy, either clone by hand:
+   ```powershell
+   git clone https://github.com/ortigasai/cwt-tax-portal.git C:\cwt-tax-portal
+   ```
+   or copy the repo over some other way. From then on, use
+   `deploy\pull-latest.ps1` (see "Redeploying" below) instead of a manual
+   `git clone`/`git pull`.
 
 2. **Create `server\.env` on the server.** Copy
    `server\.env.production.example` to `server\.env` and fill it in — see
@@ -50,8 +56,9 @@ installer/admin action on the server itself):
 
 ## Redeploying after code changes
 
+On the server, in `C:\cwt-tax-portal`:
 ```powershell
-git pull
+powershell -ExecutionPolicy Bypass -File deploy\pull-latest.ps1
 powershell -ExecutionPolicy Bypass -File deploy\deploy-iis.ps1
 ```
 
