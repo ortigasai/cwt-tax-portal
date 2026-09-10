@@ -9,9 +9,9 @@
 #
 # It does NOT restore the dump into the server's Postgres for you (that's a
 # destructive operation on the server's live data, so it's left as an
-# explicit step you run yourself) — it copies the .dump file over and
+# explicit step you run yourself)  -  it copies the .dump file over and
 # prints a ready-to-paste pg_restore command to run ON the server
-# afterward. It never handles the server DB's password — pg_restore
+# afterward. It never handles the server DB's password  -  pg_restore
 # prompts for that interactively.
 #
 # Usage (run from the repo root on this laptop):
@@ -32,9 +32,9 @@ param(
     [string]$SourceDbUser = 'postgres',
     [string]$SourceDbName = 'cwt_tax_portal',
 
-    # The server's own Postgres — only used to print a ready-to-paste
+    # The server's own Postgres  -  only used to print a ready-to-paste
     # pg_restore command at the end. Never put the server DB password here
-    # (or anywhere else in this file) — pg_restore prompts for it
+    # (or anywhere else in this file)  -  pg_restore prompts for it
     # interactively, and this script is committed to git.
     [string]$DestDbHost = '192.168.0.215',
     [string]$DestDbPort = '5432',
@@ -64,16 +64,16 @@ if (-not $dataSyncDir) { throw "DATA_SYNC_DIR not set in $envFile" }
 Write-Ok "DATA_SYNC_DIR = $dataSyncDir"
 $zonalValuesDir = Get-EnvValue 'ZONAL_VALUES_DIR'
 $zonalValuesDirDiffers = $zonalValuesDir -and ($zonalValuesDir -ne $dataSyncDir)
-if ($zonalValuesDirDiffers) { Write-Ok "ZONAL_VALUES_DIR = $zonalValuesDir (different folder — will mirror separately)" }
+if ($zonalValuesDirDiffers) { Write-Ok "ZONAL_VALUES_DIR = $zonalValuesDir (different folder  -  will mirror separately)" }
 
 if (-not (Test-Path $DestRoot)) {
-    throw "Can't reach '$DestRoot' from this laptop — confirm the server hostname/IP, that its C`$ admin share is reachable on this network, and that your account has write access. Or pass -DestRoot with a path you do have access to."
+    throw "Can't reach '$DestRoot' from this laptop  -  confirm the server hostname/IP, that its C`$ admin share is reachable on this network, and that your account has write access. Or pass -DestRoot with a path you do have access to."
 }
 
 # --- 1. Dump the database ---------------------------------------------------
 
 Write-Step "Dumping database '$SourceDbName' from $SourceDbHost`:$SourceDbPort"
-if (-not (Test-Path $PgDumpExe)) { throw "pg_dump.exe not found at $PgDumpExe — pass -PgDumpExe <path>." }
+if (-not (Test-Path $PgDumpExe)) { throw "pg_dump.exe not found at $PgDumpExe  -  pass -PgDumpExe <path>." }
 
 $outputDir = Join-Path $PSScriptRoot '_migration-output'
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
@@ -114,7 +114,7 @@ if (Test-Path $uploadsDir) {
     if ($LASTEXITCODE -ge 8) { throw "robocopy of uploads failed (exit code $LASTEXITCODE)" }
     Write-Ok "Uploads mirrored"
 } else {
-    Write-Ok "No server\uploads folder yet on this laptop — nothing to copy"
+    Write-Ok "No server\uploads folder yet on this laptop  -  nothing to copy"
 }
 
 # --- 4. Copy the dump over, print restore instructions ----------------------

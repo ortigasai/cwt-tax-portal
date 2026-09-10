@@ -10,16 +10,16 @@
 #
 # Prerequisites this script does NOT install for you (check first):
 #   - Node.js on PATH (`node -v`)
-#   - NSSM on PATH (`nssm.exe` — https://nssm.cc) or pass -NssmExe
+#   - NSSM on PATH (`nssm.exe`  -  https://nssm.cc) or pass -NssmExe
 #   - IIS with the URL Rewrite and Application Request Routing (ARR)
-#     modules — https://www.iis.net/downloads/microsoft/url-rewrite and
+#     modules  -  https://www.iis.net/downloads/microsoft/url-rewrite and
 #     https://www.iis.net/downloads/microsoft/application-request-routing
 #   - A reachable PostgreSQL instance (server/.env's DATABASE_URL)
 #
 # Usage (run as Administrator, from anywhere):
 #   powershell -ExecutionPolicy Bypass -File deploy\deploy-iis.ps1
 #
-# Safe to re-run — every step below checks current state before changing it.
+# Safe to re-run  -  every step below checks current state before changing it.
 
 param(
     [string]$RepoRoot = 'C:\cwt-tax-portal',
@@ -42,7 +42,7 @@ function Write-Warn2($msg) { Write-Host "    $msg" -ForegroundColor Yellow }
 Write-Step "Checking prerequisites"
 
 if (-not (Test-Path $RepoRoot)) {
-    throw "RepoRoot '$RepoRoot' does not exist — copy/clone the repo there first."
+    throw "RepoRoot '$RepoRoot' does not exist  -  copy/clone the repo there first."
 }
 
 try { $nodeVersion = & $NodeExe -v } catch { throw "Node.js not found (tried '$NodeExe'). Install it or pass -NodeExe <path>." }
@@ -53,17 +53,17 @@ Write-Ok "NSSM found"
 
 $rewriteDll = Join-Path $env:SystemRoot 'System32\inetsrv\rewrite.dll'
 if (-not (Test-Path $rewriteDll)) {
-    Write-Warn2 "IIS URL Rewrite module not detected at $rewriteDll — the reverse-proxy rule in web.config will not work until it's installed."
+    Write-Warn2 "IIS URL Rewrite module not detected at $rewriteDll  -  the reverse-proxy rule in web.config will not work until it's installed."
     Write-Warn2 "https://www.iis.net/downloads/microsoft/url-rewrite"
 }
 $arrDll = Join-Path ${env:ProgramFiles} 'IIS\Application Request Routing\requestRouter.dll'
 if (-not (Test-Path $arrDll)) {
-    Write-Warn2 "Application Request Routing (ARR) not detected at $arrDll — /api requests will not be proxied to the backend until it's installed."
+    Write-Warn2 "Application Request Routing (ARR) not detected at $arrDll  -  /api requests will not be proxied to the backend until it's installed."
     Write-Warn2 "https://www.iis.net/downloads/microsoft/application-request-routing"
 }
 
 if (-not (Test-Path (Join-Path $RepoRoot 'server\.env'))) {
-    throw "server\.env is missing at $RepoRoot — copy it from deploy\migrate-data.ps1's output, or fill in server\.env.production.example and save it as server\.env, before running this script."
+    throw "server\.env is missing at $RepoRoot  -  copy it from deploy\migrate-data.ps1's output, or fill in server\.env.production.example and save it as server\.env, before running this script."
 }
 
 # --- Build the server ---------------------------------------------------
@@ -118,7 +118,7 @@ if (-not $svc) {
     if ($LASTEXITCODE -ne 0) { throw "nssm install failed" }
     Write-Ok "Service installed"
 } else {
-    Write-Ok "Service already exists — updating its settings"
+    Write-Ok "Service already exists  -  updating its settings"
 }
 & $NssmExe set $ServiceName AppDirectory $serverDir
 & $NssmExe set $ServiceName AppEnvironmentExtra "PORT=$BackendPort"
@@ -149,18 +149,18 @@ if (-not (Get-Website -Name $SiteName -ErrorAction SilentlyContinue)) {
 } else {
     Set-ItemProperty "IIS:\Sites\$SiteName" -Name physicalPath -Value $clientDist
     $binding = Get-WebBinding -Name $SiteName | Select-Object -First 1
-    if ($binding -and ($binding.bindingInformation -notmatch ":$FrontendPort:")) {
+    if ($binding -and ($binding.bindingInformation -notmatch ":${FrontendPort}:")) {
         Remove-WebBinding -Name $SiteName
         New-WebBinding -Name $SiteName -Port $FrontendPort -Protocol http
     }
-    Write-Ok "Site already existed — path/binding updated"
+    Write-Ok "Site already existed  -  path/binding updated"
 }
 
 try {
     Set-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' -filter 'system.webServer/proxy' -name 'enabled' -value 'True'
     Write-Ok "ARR proxying enabled at the server level"
 } catch {
-    Write-Warn2 "Could not enable ARR proxying automatically ($($_.Exception.Message)) — if ARR is installed, enable 'Enable proxy' in IIS Manager > server node > Application Request Routing Cache > Server Proxy Settings."
+    Write-Warn2 "Could not enable ARR proxying automatically ($($_.Exception.Message))  -  if ARR is installed, enable 'Enable proxy' in IIS Manager > server node > Application Request Routing Cache > Server Proxy Settings."
 }
 
 Start-Website -Name $SiteName -ErrorAction SilentlyContinue
@@ -173,13 +173,13 @@ try {
     $backend = Invoke-WebRequest -UseBasicParsing "http://localhost:$BackendPort/api/health" -TimeoutSec 10
     Write-Ok "Backend: HTTP $($backend.StatusCode)"
 } catch {
-    Write-Warn2 "Backend health check failed: $($_.Exception.Message) — check $serverDir\logs\service-err.log"
+    Write-Warn2 "Backend health check failed: $($_.Exception.Message)  -  check $serverDir\logs\service-err.log"
 }
 try {
     $frontend = Invoke-WebRequest -UseBasicParsing "http://localhost:$FrontendPort" -TimeoutSec 10
     Write-Ok "Frontend: HTTP $($frontend.StatusCode)"
 } catch {
-    Write-Warn2 "Frontend health check failed: $($_.Exception.Message) — check IIS logs / the URL Rewrite & ARR prerequisites above."
+    Write-Warn2 "Frontend health check failed: $($_.Exception.Message)  -  check IIS logs / the URL Rewrite & ARR prerequisites above."
 }
 
 Write-Host "`nDone. Portal: http://localhost:$FrontendPort (or this server's hostname/IP from another machine, firewall/GPO permitting)." -ForegroundColor Green
