@@ -221,6 +221,10 @@ export default function Dashboard() {
               Zonal Value: {sharePointResult.zonalValue.skipped ? 'already up to date, not re-downloaded' : 'updated'}{' '}
               (SharePoint copy last modified {formatSyncTime(sharePointResult.zonalValue.sharepointModifiedAt)}).
             </p>
+            <p style={{ margin: '4px 0 0' }}>
+              Customer Ledgers: {sharePointResult.ledgers.filesChecked} file(s) checked,{' '}
+              {sharePointResult.ledgers.filesDownloaded.length} new or updated.
+            </p>
           </div>
         )}
       </div>

@@ -33,6 +33,10 @@ export interface SharePointUpdateSummary {
     sharepointSizeBytes: number;
     skipped: boolean;
   };
+  ledgers: {
+    filesChecked: number;
+    filesDownloaded: string[];
+  };
   folderSync: SyncSummary;
 }
 

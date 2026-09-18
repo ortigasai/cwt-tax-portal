@@ -30,7 +30,7 @@ export function getDataDir(): string {
 // Ledger"), and the exact wording/numbering can change over time. Falls
 // back to the literal "Payment Ledger" name if no match is found, so an
 // unnumbered setup still works.
-function findLedgerDir(): string {
+export function findLedgerDir(): string {
   try {
     const hit = fs.readdirSync(DATA_DIR, { withFileTypes: true }).find(
       (d) => d.isDirectory() && /(payment|customer)\s*ledgers?/i.test(d.name),
