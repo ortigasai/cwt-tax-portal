@@ -4,6 +4,7 @@ import { prisma } from '../lib/prisma';
 import { importCustomerLedgerBuffer, importOclp1606File } from './dataImport';
 import { contractFilePath } from '../lib/fileStorage';
 import { applyManualOverrideIfAny } from './manualOverrides';
+import { downloadCtsFile, getCtsIndex, pickLatestCts } from './sharepointCtsIndex';
 
 // Folder sync. The canonical data folder (and its subfolders) is the single
 // source of truth for ledger/CTS/1606 data — anything the user drops there
@@ -81,6 +82,7 @@ export interface SyncSummary {
   oclpLoaded: boolean;
   oclpMatchedRows: number | null;
   ctsAttached: string[];
+  ctsFetchedFromSharePoint: string[];
   errors: string[];
   skippedBusy?: boolean;
 }
@@ -105,6 +107,7 @@ export async function syncFromFolder(opts: { force?: boolean } = {}): Promise<Sy
         oclpLoaded: false,
         oclpMatchedRows: null,
         ctsAttached: [],
+        ctsFetchedFromSharePoint: [],
         errors: [],
         skippedBusy: true,
       }
@@ -122,6 +125,7 @@ export async function syncFromFolder(opts: { force?: boolean } = {}): Promise<Sy
     oclpLoaded: false,
     oclpMatchedRows: null,
     ctsAttached: [],
+    ctsFetchedFromSharePoint: [],
     errors: [],
   };
 
@@ -249,6 +253,40 @@ export async function syncFromFolder(opts: { force?: boolean } = {}): Promise<Sy
       } catch (e) {
         summary.errors.push(`CTS ${f}: ${(e as Error).message}`);
       }
+    }
+
+    // 6. Any contract still missing a CTS after the local pass -- fall back
+    // to the SharePoint Property Sales library (see sharepointCtsIndex.ts),
+    // which mirrors DATA_SYNC_DIR's CTS folder as a last resort rather than
+    // a replacement for it (a locally-dropped CTS always wins; this only
+    // fills genuine gaps). Best-effort: SharePoint being unreachable
+    // shouldn't fail the whole sync.
+    try {
+      const stillMissing = await prisma.contract.findMany({
+        where: { ctsFileName: null },
+        select: { id: true, contractNumber: true },
+      });
+      if (stillMissing.length > 0) {
+        const ctsIndex = await getCtsIndex();
+        for (const contract of stillMissing) {
+          const entries = ctsIndex.get(contract.contractNumber);
+          const best = entries ? pickLatestCts(entries) : null;
+          if (!best) continue;
+          try {
+            const bytes = await downloadCtsFile(best);
+            fs.writeFileSync(contractFilePath(contract.contractNumber, best.fileName), bytes);
+            await prisma.contract.update({
+              where: { id: contract.id },
+              data: { ctsFileName: best.fileName },
+            });
+            summary.ctsFetchedFromSharePoint.push(contract.contractNumber);
+          } catch (e) {
+            summary.errors.push(`SharePoint CTS for ${contract.contractNumber}: ${(e as Error).message}`);
+          }
+        }
+      }
+    } catch (e) {
+      summary.errors.push(`SharePoint CTS index: ${(e as Error).message}`);
     }
   } finally {
     summary.durationMs = Date.now() - start;

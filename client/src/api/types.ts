@@ -10,6 +10,7 @@ export interface SyncSummary {
   oclpLoaded: boolean;
   oclpMatchedRows: number | null;
   ctsAttached: string[];
+  ctsFetchedFromSharePoint: string[];
   errors: string[];
   skippedBusy?: boolean;
 }

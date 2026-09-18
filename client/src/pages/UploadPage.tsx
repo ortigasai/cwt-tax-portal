@@ -62,6 +62,9 @@ export default function UploadPage() {
             From the data folder: {result.syncSummary.ledgersLoaded.length} customer ledger(s) loaded, OCLP 1606{' '}
             {result.syncSummary.oclpLoaded ? 'reloaded' : 'unchanged'}, {result.syncSummary.ctsAttached.length} CTS
             file(s) attached.
+            {result.syncSummary.ctsFetchedFromSharePoint.length > 0 && (
+              <> {result.syncSummary.ctsFetchedFromSharePoint.length} more CTS file(s) auto-fetched from SharePoint.</>
+            )}
           </p>
           {result.syncSummary.errors.length > 0 && (
             <div className="callout callout-error" style={{ marginTop: 8 }}>
