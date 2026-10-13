@@ -90,10 +90,14 @@ Push-Location (Join-Path $RepoRoot 'server')
 try {
     & npm install
     if ($LASTEXITCODE -ne 0) { throw "npm install (server) failed" }
-    & npm run build
-    if ($LASTEXITCODE -ne 0) { throw "npm run build (server) failed" }
+    # Generate the Prisma client BEFORE building: the build type-checks against
+    # src\generated\prisma and then copies it into dist\. Generating after the
+    # build meant tsc compiled against the previous deploy's stale client, so
+    # any schema change (a new column or model) failed the build.
     & npx prisma generate
     if ($LASTEXITCODE -ne 0) { throw "prisma generate failed" }
+    & npm run build
+    if ($LASTEXITCODE -ne 0) { throw "npm run build (server) failed" }
     Write-Step "Applying database migrations"
     & npx prisma migrate deploy
     if ($LASTEXITCODE -ne 0) { throw "prisma migrate deploy failed" }
