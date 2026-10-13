@@ -175,5 +175,22 @@ model ImportBatch {
   filename    String
   rowCount    Int
   batchNumber Int?       // sequential number for CONTRACT_LIST uploads
+  // User-editable display name for a CONTRACT_LIST batch. Null = never
+  // renamed; the UI/API then fall back to the uploaded file's name.
+  title       String?
   importedAt  DateTime   @default(now())
+}
+
+// One run of the ETB Calculator: which contracts were uploaded and the ETB
+// start date used. Only the inputs are stored — the results are recomputed
+// from the contracts' current data whenever the run is opened, so the ETB
+// Dashboard never shows stale numbers.
+model EtbRun {
+  id              Int       @id @default(autoincrement())
+  // User-editable display name; null = never renamed (falls back to filename).
+  title           String?
+  filename        String
+  startDate       DateTime?
+  contractNumbers String[]
+  createdAt       DateTime  @default(now())
 }

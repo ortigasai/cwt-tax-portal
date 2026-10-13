@@ -181,8 +181,7 @@ function buildDuplicateSheet(wb: ExcelJS.Workbook, input: LedgerExportInput): vo
     ['CWT Tax Due (Tax Base x 5%)', e.cwtTaxDue],
     ['Actual CWT Remitted (total)', e.actualRemitted],
     ['CWT Variance / Exposure (total)', e.variance],
-    ['Status', e.status],
-    ['Deadline Rule Applied', e.deadline.note],
+    ['Status', e.status === 'NON_COMPLIANT' ? 'NOT COMPLIANT (penalties computed)' : e.status],
     ['Surcharge', surchargeTotal],
     ['Compromise Penalty', compromiseTotal],
     ['Interest', interestTotal],
@@ -258,7 +257,14 @@ function buildDuplicateSheet(wb: ExcelJS.Workbook, input: LedgerExportInput): vo
   const taxBaseRow = sheet.getRow(pr++);
   taxBaseRow.getCell(pivotCol).value = 'Tax Base';
   bold(taxBaseRow.getCell(pivotCol));
-  taxBaseRow.getCell(pivotCol + 4).value = taxBaseSourceLabel(e.taxBaseSource);
+  // The basis name (which of Net TCP / Zonal Value / FMV won) sits under the
+  // Unit column; the amount itself goes in the Total column, aligned with the
+  // other totals above it.
+  taxBaseRow.getCell(pivotCol + 1).value = taxBaseSourceLabel(e.taxBaseSource);
+  const taxBaseAmountCell = taxBaseRow.getCell(pivotCol + 4);
+  taxBaseAmountCell.value = e.cwtTaxBase ?? '';
+  if (typeof e.cwtTaxBase === 'number') taxBaseAmountCell.numFmt = CURRENCY_FMT;
+  bold(taxBaseAmountCell);
 
   // The summary block (col H onward) can run longer than the UNIT/BUYER/
   // CONTRACT block (col A-F, fixed by writeHeaderBlock at row 16) — start
@@ -309,7 +315,11 @@ function buildDuplicateSheet(wb: ExcelJS.Workbook, input: LedgerExportInput): vo
     row.getCell(5).numFmt = CURRENCY_FMT;
     row.getCell(6).value = line.paymentVat ?? '';
     row.getCell(6).numFmt = CURRENCY_FMT;
-    row.getCell(7).value = line.applicableDeadline ?? '';
+    // A payment after an AR Sale bulk remittance has no deadline — say why
+    // rather than leaving the cell blank.
+    row.getCell(7).value = line.coveredByBulkRemittance
+      ? 'Covered by AR Sale bulk remittance'
+      : (line.applicableDeadline ?? '');
     if (line.applicableDeadline) row.getCell(7).numFmt = DATE_FMT;
     row.getCell(8).value = line.shouldBeCwtDue ?? '';
     if (line.shouldBeCwtDue !== null) row.getCell(8).numFmt = CURRENCY_FMT;
@@ -324,7 +334,13 @@ function buildDuplicateSheet(wb: ExcelJS.Workbook, input: LedgerExportInput): vo
     if (line.cwtFileTaxBase !== null) row.getCell(11).numFmt = CURRENCY_FMT;
     row.getCell(12).value = line.cwtFileTaxDue ?? '';
     if (line.cwtFileTaxDue !== null) row.getCell(12).numFmt = CURRENCY_FMT;
-    row.getCell(13).value = line.remittedInDeadlineMonth === null ? '' : line.remittedInDeadlineMonth ? 'Yes' : 'No';
+    row.getCell(13).value = line.paidInAdvance
+      ? 'Paid in advance'
+      : line.remittedInDeadlineMonth === null
+        ? ''
+        : line.remittedInDeadlineMonth
+          ? 'Yes'
+          : 'No';
     row.getCell(14).value = line.difference ?? '';
     if (line.difference !== null) row.getCell(14).numFmt = CURRENCY_FMT;
 
@@ -379,7 +395,7 @@ function buildDuplicateSheet(wb: ExcelJS.Workbook, input: LedgerExportInput): vo
 
 export async function generateLedgerExcel(input: LedgerExportInput): Promise<Buffer> {
   const wb = new ExcelJS.Workbook();
-  wb.creator = 'CWT Tax Exposure Portal';
+  wb.creator = 'Pre-ONETT';
   wb.created = new Date();
   buildLedgerSheet(wb, input);
   buildDuplicateSheet(wb, input);

@@ -1,4 +1,4 @@
-﻿# Restarts the CWT Tax Exposure Portal's local stack: PostgreSQL, then the
+﻿# Restarts Pre-ONETT's local stack: PostgreSQL, then the
 # server and client dev processes. Safe to double-click (or "Run with
 # PowerShell") any time the portal stops responding after this machine
 # sleeps/restarts, since none of these three processes are set up to
@@ -42,4 +42,4 @@ Start-Process powershell -ArgumentList @(
 
 Write-Host ''
 Write-Host 'Two new PowerShell windows opened for the server and client — leave them running.' -ForegroundColor Yellow
-Write-Host 'Portal: http://localhost:5173  (login: cwtportal / taxteam2026!)' -ForegroundColor Green
+Write-Host 'Portal: http://localhost:5173  (login: preonett / taxteam2026!)' -ForegroundColor Green

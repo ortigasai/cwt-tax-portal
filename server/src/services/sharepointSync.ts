@@ -1,8 +1,12 @@
 import fs from 'fs';
 import path from 'path';
 import * as XLSX from 'xlsx';
-import { downloadFile, fetchMetadata, listItems } from './sharepointApi';
-import { findLedgerDir, getDataDir, syncFromFolder, SyncSummary } from './folderSync';
+import { downloadFile, fetchMetadata, listItems, SharePointItemMetadata } from './sharepointApi';
+import { contractFromLedgerName, findLedgerDir, getDataDir, syncFromFolder, SyncSummary } from './folderSync';
+import { importCustomerLedgerBuffer } from './dataImport';
+import { parseCustomerLedger } from '../parsers/customerLedgerParser';
+import { nonCurrentClearingDocs } from '../lib/clearingSeries';
+import { fetchReviewedLedger } from './reviewedLedgers';
 
 // Pulls the SharePoint-hosted reference files this app depends on straight
 // from the live "Tax Team" library (via the IT-issued API — see
@@ -30,6 +34,10 @@ const LEDGERS_SHAREPOINT_PATH =
 
 function localOclpPath(): string {
   return path.join(getDataDir(), OCLP_FILENAME);
+}
+
+export function localOclpFilePath(): string {
+  return localOclpPath();
 }
 
 function localZonalPath(): string {
@@ -67,13 +75,35 @@ function readBaseContractMap(filePath: string): Map<string, string> {
   return map;
 }
 
+// Looks at just the FINAL tab of a downloaded 1606 workbook: does it already
+// have a "Base Contract" header in column O, and how many data rows have a
+// value there?
+function inspectNativeBaseContract(buffer: Buffer): { headerPresent: boolean; filled: number; blank: number } {
+  const wb = XLSX.read(buffer, { type: 'buffer', sheets: 'FINAL' });
+  const ws = wb.Sheets['FINAL'];
+  if (!ws) return { headerPresent: false, filled: 0, blank: 0 };
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' }) as unknown[][];
+  const headerPresent = /base\s*contract/i.test(String(rows[1]?.[14] ?? ''));
+  let filled = 0;
+  let blank = 0;
+  for (let i = 2; i < rows.length; i++) {
+    if (!String(rows[i][2] ?? '').trim()) continue;
+    if (String(rows[i][14] ?? '').trim()) filled++;
+    else blank++;
+  }
+  return { headerPresent, filled, blank };
+}
+
 function applyBaseContract(buffer: Buffer, baseContractMap: Map<string, string>): { buffer: Buffer; matched: number; selfReferenced: number } {
   const wb = XLSX.read(buffer, { type: 'buffer' });
   const ws = wb.Sheets['FINAL'];
   if (!ws || !ws['!ref']) return { buffer, matched: 0, selfReferenced: 0 };
 
   const range = XLSX.utils.decode_range(ws['!ref']);
-  XLSX.utils.sheet_add_aoa(ws, [['Base contract']], { origin: { r: 1, c: 14 } });
+  const headerCell = ws[XLSX.utils.encode_cell({ r: 1, c: 14 })];
+  if (!headerCell || !String(headerCell.v ?? '').trim()) {
+    XLSX.utils.sheet_add_aoa(ws, [['Base Contract']], { origin: { r: 1, c: 14 } });
+  }
 
   let matched = 0;
   let selfReferenced = 0;
@@ -81,6 +111,11 @@ function applyBaseContract(buffer: Buffer, baseContractMap: Map<string, string>)
     const cell = ws[XLSX.utils.encode_cell({ r, c: 2 })];
     const contractNo = cell ? String(cell.v).trim() : '';
     if (!contractNo) continue;
+    const existing = ws[XLSX.utils.encode_cell({ r, c: 14 })];
+    if (existing && String(existing.v ?? '').trim()) {
+      matched++; // already filled in the file itself — leave it alone
+      continue;
+    }
     const bc = baseContractMap.get(contractNo);
     if (bc) {
       matched++;
@@ -127,7 +162,7 @@ async function syncLedgersFromSharePoint(): Promise<{ filesChecked: number; file
   fs.mkdirSync(localDir, { recursive: true });
 
   const remote = await listItems('tax-team-api', LEDGERS_SHAREPOINT_PATH);
-  const files = remote.items.filter((item) => item.type === 'file' && /\.xlsx$/i.test(item.name));
+  const files = remote.items.filter((item) => item.type === 'file' && contractFromLedgerName(item.name) !== null);
 
   const downloaded: string[] = [];
   for (const item of files) {
@@ -146,15 +181,211 @@ async function syncLedgersFromSharePoint(): Promise<{ filesChecked: number; file
   return { filesChecked: files.length, filesDownloaded: downloaded };
 }
 
+// Pulls the 1606 Summary (FINAL tab is what the importer reads) from
+// SharePoint into the local watched folder, carrying the Base Contract
+// column forward from the current local copy. Read-only against SharePoint.
+// Unless `force`, skips the (large) download when the local copy's
+// timestamp already matches SharePoint's modified time — the local file is
+// stamped with SharePoint's modified time after every pull so this check
+// works on the next call.
+export async function pullOclpFromSharePoint(
+  opts: { force?: boolean } = {},
+): Promise<{
+  meta: SharePointItemMetadata;
+  downloaded: boolean;
+  baseContractMatched: number;
+  baseContractSelfReferenced: number;
+}> {
+  const meta = await fetchMetadata('tax-team-api', OCLP_SHAREPOINT_PATH);
+  const localPath = localOclpPath();
+  const stat = fs.existsSync(localPath) ? fs.statSync(localPath) : null;
+  const current = stat !== null && Math.abs(stat.mtime.getTime() - new Date(meta.modified_at).getTime()) < 2000;
+  if (!opts.force && current) {
+    return { meta, downloaded: false, baseContractMatched: 0, baseContractSelfReferenced: 0 };
+  }
+
+  const raw = await downloadFile('tax-team-api', OCLP_SHAREPOINT_PATH);
+
+  // The tax team now maintains the "Base Contract" column (O) in the
+  // SharePoint file itself. When it's there and essentially filled in, that
+  // column is the source of truth: save the file byte-for-byte untouched
+  // (no re-serialising a 19MB workbook into a 98MB one, and no overwriting
+  // the team's values with older local ones).
+  const native = inspectNativeBaseContract(raw);
+  const total = native.filled + native.blank;
+  if (native.headerPresent && total > 0 && native.filled / total >= 0.9) {
+    fs.writeFileSync(localPath, raw);
+    fs.utimesSync(localPath, new Date(), new Date(meta.modified_at));
+    return { meta, downloaded: true, baseContractMatched: native.filled, baseContractSelfReferenced: native.blank };
+  }
+
+  // Older file without the column (or barely started): carry Base Contract
+  // values forward from the current local copy, never overwriting a value
+  // that's already in the file.
+  const baseContractMap = readBaseContractMap(localPath);
+  const { buffer, matched, selfReferenced } = applyBaseContract(raw, baseContractMap);
+  fs.writeFileSync(localPath, buffer);
+  fs.utimesSync(localPath, new Date(), new Date(meta.modified_at));
+  return { meta, downloaded: true, baseContractMatched: matched, baseContractSelfReferenced: selfReferenced };
+}
+
+// Retrieves just the given contracts' customer ledgers (not the whole
+// folder) and imports each one. Source order: the SharePoint Ledgers
+// folder, then the local ledger folder as a fallback. A contract with no
+// ledger anywhere is reported as notFound, not an error.
+// A ledger that is not LedgerFit's latest, corrected one: some payment rows
+// still carry a clearing document outside the "14" series (see
+// lib/clearingSeries.ts).
+export interface LedgerNotLatest {
+  contractNumber: string;
+  fileName: string;
+  nonCurrentDocs: number;
+  sample: string[];
+}
+
+export async function fetchLedgersForContracts(
+  contractNumbers: string[],
+): Promise<{
+  loaded: string[];
+  fromReviewed: string[];
+  notFound: string[];
+  notLatest: LedgerNotLatest[];
+  errors: string[];
+}> {
+  const loaded: string[] = [];
+  const fromReviewed: string[] = [];
+  const notFound: string[] = [];
+  const notLatest: LedgerNotLatest[] = [];
+  const errors: string[] = [];
+  const localDir = findLedgerDir();
+
+  // File names carry a suffix in LedgerFit's current style
+  // ("ledgerfit_<contract>_dates-per-SI.xlsx"), so list the folder once and
+  // match each contract by the number inside the name. If a contract has
+  // both styles, the LedgerFit one wins; among several, the newest.
+  const rank = (it: SharePointItemMetadata) =>
+    (it.name.toLowerCase().startsWith('ledgerfit_') ? 1e15 : 0) + Date.parse(it.modified_at || '') || 0;
+  // Every candidate file per contract, best first. The first one whose
+  // clearing documents are all in the current series wins; if none is, the
+  // best-ranked is used and flagged as not the latest ledger.
+  const remoteCandidates = new Map<string, SharePointItemMetadata[]>();
+  let listingTruncated = false;
+  try {
+    const listing = await listItems('tax-team-api', LEDGERS_SHAREPOINT_PATH);
+    listingTruncated = listing.truncated;
+    for (const it of listing.items) {
+      if (it.type !== 'file') continue;
+      const n = contractFromLedgerName(it.name);
+      if (!n) continue;
+      const list = remoteCandidates.get(n) ?? [];
+      list.push(it);
+      remoteCandidates.set(n, list);
+    }
+    for (const list of remoteCandidates.values()) list.sort((a, b) => rank(b) - rank(a));
+  } catch (e) {
+    errors.push(`SharePoint Ledgers folder: ${(e as Error).message} — falling back to the local ledger folder`);
+  }
+
+  for (const n of contractNumbers) {
+    let fileName = `ledgerfit_${n}`;
+    try {
+      // First choice: the Tax team's Reviewed & Accepted ledger (LedgerFit's
+      // corrected combined ledger, served by the DOAS system).
+      const reviewed = await fetchReviewedLedger(n).catch(() => null);
+      if (reviewed) {
+        const r = await importCustomerLedgerBuffer(n, reviewed.buffer, reviewed.fileName);
+        if (r.ok) {
+          loaded.push(n);
+          fromReviewed.push(n);
+        } else {
+          errors.push(`Ledger ${reviewed.fileName}: contract ${n} could not be created`);
+        }
+        const stale = await nonCurrentSeriesIn(reviewed.buffer);
+        if (stale.length > 0) {
+          notLatest.push({ contractNumber: n, fileName: reviewed.fileName, nonCurrentDocs: stale.length, sample: stale.slice(0, 3) });
+        }
+        continue;
+      }
+
+      let buf: Buffer | null = null;
+      const candidates = remoteCandidates.get(n) ?? [];
+      if (candidates.length > 0) {
+        for (const item of candidates) {
+          const candidate = await downloadFile('tax-team-api', item.path);
+          if (buf === null) {
+            // Best-ranked file: the fallback if no candidate is fully current.
+            buf = candidate;
+            fileName = item.name;
+          }
+          if (await isCurrentSeries(candidate)) {
+            buf = candidate;
+            fileName = item.name;
+            break;
+          }
+        }
+      } else if (listingTruncated) {
+        // Listing was cut off, so absence from it proves nothing — try the
+        // two exact names directly. A 404 just means "not there".
+        for (const guess of [`ledgerfit_${n}_dates-per-SI.xlsx`, `Customer_Ledger_${n}.xlsx`]) {
+          try {
+            buf = await downloadFile('tax-team-api', `${LEDGERS_SHAREPOINT_PATH}/${guess}`);
+            fileName = guess;
+            break;
+          } catch (e) {
+            if (!/\(404\)/.test((e as Error).message)) throw e;
+          }
+        }
+      }
+      if (!buf && fs.existsSync(localDir)) {
+        const local = fs
+          .readdirSync(localDir)
+          .filter((f) => contractFromLedgerName(f) === n)
+          .sort((a, b) => Number(b.toLowerCase().startsWith('ledgerfit_')) - Number(a.toLowerCase().startsWith('ledgerfit_')));
+        if (local.length > 0) {
+          fileName = local[0];
+          buf = fs.readFileSync(path.join(localDir, local[0]));
+        }
+      }
+      if (!buf) {
+        notFound.push(n);
+        continue;
+      }
+      const r = await importCustomerLedgerBuffer(n, buf, fileName);
+      if (r.ok) loaded.push(n);
+      else errors.push(`Ledger ${fileName}: contract ${n} could not be created`);
+
+      const stale = await nonCurrentSeriesIn(buf);
+      if (stale.length > 0) {
+        notLatest.push({ contractNumber: n, fileName, nonCurrentDocs: stale.length, sample: stale.slice(0, 3) });
+      }
+    } catch (e) {
+      errors.push(`Ledger ${fileName}: ${(e as Error).message}`);
+    }
+  }
+  return { loaded, fromReviewed, notFound, notLatest, errors };
+}
+
+async function nonCurrentSeriesIn(buffer: Buffer): Promise<string[]> {
+  const parsed = await parseCustomerLedger(buffer);
+  return nonCurrentClearingDocs(parsed.paymentRecords.filter((p) => !p.isSubtotal).map((p) => p.clearingDocument));
+}
+
+async function isCurrentSeries(buffer: Buffer): Promise<boolean> {
+  try {
+    return (await nonCurrentSeriesIn(buffer)).length === 0;
+  } catch {
+    return false;
+  }
+}
+
 export async function updateFromSharePoint(): Promise<SharePointUpdateSummary> {
-  // 1606 Summary — always re-pulled (it's filed continuously; there's no
-  // cheap way to know in advance whether new rows landed since a size/mtime
-  // check wouldn't catch newly-added remittances without re-downloading).
-  const oclpMeta = await fetchMetadata('tax-team-api', OCLP_SHAREPOINT_PATH);
-  const baseContractMap = readBaseContractMap(localOclpPath());
-  const oclpRaw = await downloadFile('tax-team-api', OCLP_SHAREPOINT_PATH);
-  const { buffer: oclpMerged, matched, selfReferenced } = applyBaseContract(oclpRaw, baseContractMap);
-  fs.writeFileSync(localOclpPath(), oclpMerged);
+  // 1606 Summary — always re-pulled here (the manual "Update from
+  // SharePoint" button), even if the timestamp looks current.
+  const {
+    meta: oclpMeta,
+    baseContractMatched: matched,
+    baseContractSelfReferenced: selfReferenced,
+  } = await pullOclpFromSharePoint({ force: true });
 
   // Zonal Value — small enough, and changes rarely enough, that it's worth
   // skipping the download entirely when the local copy is already current

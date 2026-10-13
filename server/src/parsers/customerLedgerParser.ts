@@ -28,12 +28,28 @@ export interface CustomerLedgerParseResult {
 // pairs) followed by a payment-schedule table. We scan every cell for known
 // labels rather than assuming fixed row/column positions, since row offsets
 // vary slightly between exports (extra blank rows, etc).
+//
+// Two layouts are supported: the original Customer Ledger export, and
+// LedgerFit's current "Assessment-Ready Payment Ledger" (label "Unit"
+// instead of "Units", "Total Contract Price (incl. VAT)", a "TOTAL" column,
+// a closing TOTAL row, and "◄ …" review notes appended inside OR Number
+// cells).
 const LABELS: Record<string, keyof Pick<CustomerLedgerParseResult, 'estate' | 'tower' | 'unit' | 'buyerName'>> = {
   estate: 'estate',
   project: 'tower',
   units: 'unit',
+  unit: 'unit',
   "buyer's name": 'buyerName',
 };
+
+// LedgerFit appends review notes to the OR Number cell, e.g.
+// "3038254   ◄ 2.10% @ end of sale year (< 25%)". Only the OR number itself
+// belongs in the record.
+function cleanOrNumber(raw: string | null): string | null {
+  if (!raw) return raw;
+  const cleaned = raw.split(/[◄◀]/)[0].trim();
+  return cleaned || null;
+}
 
 export async function parseCustomerLedger(buffer: Buffer): Promise<CustomerLedgerParseResult> {
   const workbook = new ExcelJS.Workbook();
@@ -63,7 +79,7 @@ export async function parseCustomerLedger(buffer: Buffer): Promise<CustomerLedge
 
       if (label === 'contract no') {
         result.contractNumber = normalizeContractNumber(row.getCell(c + 1).value);
-      } else if (label === 'total contract price (tcp)') {
+      } else if (label.startsWith('total contract price')) {
         result.totalTCP = parseNumber(row.getCell(c + 1).value);
       } else if (label === 'net tcp') {
         result.netTCP = parseNumber(row.getCell(c + 1).value);
@@ -95,17 +111,21 @@ export async function parseCustomerLedger(buffer: Buffer): Promise<CustomerLedge
       // silently dropping the payment from CWT computation.
       const totalCollection =
         parseNumber(get('total collection')) ??
+        parseNumber(get('total')) ??
         (paymentPrincipal !== null || paymentVat !== null ? round2((paymentPrincipal ?? 0) + (paymentVat ?? 0)) : null);
       if (totalCollection === null && paymentDate === null) continue;
+      // LedgerFit closes the table with a "TOTAL" row in the Payment Date
+      // column — a subtotal, never a payment.
+      const isTotalRow = /^total$/i.test(cellText(get('payment date')) ?? '');
       result.paymentRecords.push({
         baselineDate: parseDate(get('baseline date')),
         paymentDate,
         totalCollection,
         clearingDocument: cellText(get('clearing document')),
-        orNumber: cellText(get('or number')),
+        orNumber: cleanOrNumber(cellText(get('or number'))),
         paymentPrincipal,
         paymentVat,
-        isSubtotal: parseNumber(get('issubtotal')) === 1,
+        isSubtotal: isTotalRow || parseNumber(get('issubtotal')) === 1,
       });
     }
   }

@@ -9,7 +9,7 @@ const app = createApp();
 const port = Number(process.env.PORT ?? 4100);
 
 const server = app.listen(port, () => {
-  console.log(`CWT Tax Exposure Portal API listening on http://localhost:${port}`);
+  console.log(`Pre-ONETT API listening on http://localhost:${port}`);
   console.log(`[folder-sync] watching (on demand only — no background loop): ${getDataDir()}`);
 });
 

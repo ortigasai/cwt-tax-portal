@@ -5,13 +5,15 @@ import { importCustomerLedgerBuffer, importOclp1606File } from './dataImport';
 import { contractFilePath } from '../lib/fileStorage';
 import { applyManualOverrideIfAny } from './manualOverrides';
 import { downloadCtsFile, getCtsIndex, pickLatestCts } from './sharepointCtsIndex';
+import { REVIEWED_LEDGER_PREFIX } from './reviewedLedgers';
 
 // Folder sync. The canonical data folder (and its subfolders) is the single
 // source of truth for ledger/CTS/1606 data — anything the user drops there
 // is picked up without a manual per-file upload. There is no background
 // loop: this runs only when explicitly triggered — from the dashboard's
-// "Sync from folder now" button, or automatically as part of uploading a
-// contract-number list (see routes/contracts.ts).
+// "Sync from folder now" / "Update from SharePoint" buttons. Uploading a
+// contract-number list does NOT run it; that retrieves data for just the
+// uploaded contracts (see contractIntake.ts).
 
 const DEFAULT_DATA_DIR =
   'C:/Users/Corporate Finance AI/OneDrive - Ortigas & Company, Limited Partnership/2026 CWT portal';
@@ -63,8 +65,14 @@ function markSynced(file: string): void {
   if (sig !== null) fileSig.set(file, sig);
 }
 
-function contractFromLedgerName(filename: string): string | null {
-  const m = filename.match(/Customer_Ledger_(\d+)\.xlsx$/i);
+// Ledger files come in two naming styles: the original
+// "Customer_Ledger_<contract>.xlsx" and LedgerFit's current
+// "ledgerfit_<contract>_<anything>.xlsx" (e.g. ledgerfit_2000000001503_dates-per-SI.xlsx).
+// Returns the contract number for either, or null for anything else
+// (including Excel's "~$" lock files).
+export function contractFromLedgerName(filename: string): string | null {
+  if (filename.startsWith('~$')) return null;
+  const m = filename.match(/^(?:Customer_Ledger_|ledgerfit_)(\d+)(?:_[^\\/]*)?\.xlsx$/i);
   return m ? m[1] : null;
 }
 function contractFromCtsName(filename: string): string | null {
@@ -85,6 +93,43 @@ export interface SyncSummary {
   ctsFetchedFromSharePoint: string[];
   errors: string[];
   skippedBusy?: boolean;
+}
+
+// Fetches a CTS from the SharePoint Property Sales library (see
+// sharepointCtsIndex.ts) for every contract that has none yet — or only for
+// `onlyNumbers` when given (used when uploading a contract list, so just the
+// uploaded contracts are touched). Best-effort: SharePoint being
+// unreachable is reported in `errors`, never thrown.
+export async function attachCtsFromSharePoint(
+  onlyNumbers?: string[],
+): Promise<{ fetched: string[]; errors: string[] }> {
+  const fetched: string[] = [];
+  const errors: string[] = [];
+  try {
+    const stillMissing = await prisma.contract.findMany({
+      where: { ctsFileName: null, ...(onlyNumbers ? { contractNumber: { in: onlyNumbers } } : {}) },
+      select: { id: true, contractNumber: true },
+    });
+    if (stillMissing.length > 0) {
+      const ctsIndex = await getCtsIndex();
+      for (const contract of stillMissing) {
+        const entries = ctsIndex.get(contract.contractNumber);
+        const best = entries ? pickLatestCts(entries) : null;
+        if (!best) continue;
+        try {
+          const bytes = await downloadCtsFile(best);
+          fs.writeFileSync(contractFilePath(contract.contractNumber, best.fileName), bytes);
+          await prisma.contract.update({ where: { id: contract.id }, data: { ctsFileName: best.fileName } });
+          fetched.push(contract.contractNumber);
+        } catch (e) {
+          errors.push(`SharePoint CTS for ${contract.contractNumber}: ${(e as Error).message}`);
+        }
+      }
+    }
+  } catch (e) {
+    errors.push(`SharePoint CTS index: ${(e as Error).message}`);
+  }
+  return { fetched, errors };
 }
 
 let running = false;
@@ -136,7 +181,7 @@ export async function syncFromFolder(opts: { force?: boolean } = {}): Promise<Sy
     try {
       ledgerFiles = fs
         .readdirSync(ledgerDir)
-        .filter((f) => /^Customer_Ledger_\d+\.xlsx$/i.test(f) && !f.startsWith('~$'));
+        .filter((f) => contractFromLedgerName(f) !== null);
     } catch (e) {
       summary.errors.push(`Payment Ledger folder unreadable: ${(e as Error).message}`);
     }
@@ -191,9 +236,23 @@ export async function syncFromFolder(opts: { force?: boolean } = {}): Promise<Sy
     }
 
     // 3. Load ledgers whose file changed, or whose contract is missing data.
+    // A contract already loaded from its Reviewed & Accepted ledger keeps it:
+    // a (possibly older, raw) file in the folder must not overwrite it.
+    const reviewedLoaded = new Set(
+      (
+        await prisma.contract.findMany({
+          where: { customerLedgerFileName: { startsWith: REVIEWED_LEDGER_PREFIX } },
+          select: { contractNumber: true },
+        })
+      ).map((c) => c.contractNumber),
+    );
     for (const f of ledgerFiles) {
       const n = contractFromLedgerName(f);
       if (!n) continue;
+      if (reviewedLoaded.has(n)) {
+        summary.ledgersSkipped++;
+        continue;
+      }
       const full = path.join(ledgerDir, f);
       if (!opts.force && !hasChanged(full) && !needsLoad.has(n)) {
         summary.ledgersSkipped++;
@@ -261,33 +320,9 @@ export async function syncFromFolder(opts: { force?: boolean } = {}): Promise<Sy
     // a replacement for it (a locally-dropped CTS always wins; this only
     // fills genuine gaps). Best-effort: SharePoint being unreachable
     // shouldn't fail the whole sync.
-    try {
-      const stillMissing = await prisma.contract.findMany({
-        where: { ctsFileName: null },
-        select: { id: true, contractNumber: true },
-      });
-      if (stillMissing.length > 0) {
-        const ctsIndex = await getCtsIndex();
-        for (const contract of stillMissing) {
-          const entries = ctsIndex.get(contract.contractNumber);
-          const best = entries ? pickLatestCts(entries) : null;
-          if (!best) continue;
-          try {
-            const bytes = await downloadCtsFile(best);
-            fs.writeFileSync(contractFilePath(contract.contractNumber, best.fileName), bytes);
-            await prisma.contract.update({
-              where: { id: contract.id },
-              data: { ctsFileName: best.fileName },
-            });
-            summary.ctsFetchedFromSharePoint.push(contract.contractNumber);
-          } catch (e) {
-            summary.errors.push(`SharePoint CTS for ${contract.contractNumber}: ${(e as Error).message}`);
-          }
-        }
-      }
-    } catch (e) {
-      summary.errors.push(`SharePoint CTS index: ${(e as Error).message}`);
-    }
+    const sp = await attachCtsFromSharePoint();
+    summary.ctsFetchedFromSharePoint.push(...sp.fetched);
+    summary.errors.push(...sp.errors);
   } finally {
     summary.durationMs = Date.now() - start;
     last = summary;
@@ -297,10 +332,10 @@ export async function syncFromFolder(opts: { force?: boolean } = {}): Promise<Sy
   return summary;
 }
 
-// There is no automatic/background sync loop anymore — syncFromFolder is
-// only ever invoked in response to something the user actually did: the
-// dashboard's "Sync from folder now" button (see routes/sync.ts), or
-// uploading a contract-number list (see routes/contracts.ts's upload-list
-// handler, which syncs right after creating the new contract stubs so their
-// ledger/CTS/1606 data comes in from DATA_SYNC_DIR immediately rather than
-// waiting on a background poll).
+// There is no automatic/background sync loop — syncFromFolder only runs when
+// the user clicks the dashboard's "Sync from folder now" button (see
+// routes/sync.ts) or "Update from SharePoint" (sharepointSync.ts). Uploading
+// a contract-number list deliberately does not call it: that would create
+// every contract found in the folder, not just the uploaded ones. The
+// upload retrieves data for only its own contracts via
+// contractIntake.ts.

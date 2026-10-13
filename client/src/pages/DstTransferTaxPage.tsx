@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { computeDstTransferTax, dstTransferTaxTemplateUrl } from '../api/client';
+import FileDropzone from '../components/FileDropzone';
+import Icon from '../components/Icon';
 
 const OUTPUT_FILENAME = 'DST and Transfer Tax Computation.xlsx';
 
@@ -53,49 +55,71 @@ export default function DstTransferTaxPage() {
   }
 
   return (
-    <div className="card">
-      <h2>DST &amp; Transfer Tax Review</h2>
-      <p className="muted">
-        1. Download the template below and fill in Contract Number, Tower, Unit/Storage Area, Parking Area, CTS
-        Notary Date, TCP (net of VAT), and FMV per Tax Declaration.
-      </p>
-      <p className="muted">
-        2. Upload the filled-in file — RDO, Tagging, and Unit/Storage &amp; Parking ZV/sqm are traced from the tax
-        team's Zonal Value reference as of each row's CTS Notary Date (the same lookup used on a contract's detail
-        page), and Total ZV Unit/Storage, Total ZV Parking, and Total ZV are computed with real Excel formulas so
-        you can audit the math directly in the downloaded workbook.
-      </p>
-
-      <a className="btn btn-primary" href={dstTransferTaxTemplateUrl()} style={{ marginBottom: 16, display: 'inline-block' }}>
-        ⬇ Download Template
-      </a>
-
-      <div className="upload-box">
-        <input
-          type="file"
-          accept=".xlsx,.xls"
-          disabled={busy}
-          onChange={(e) => {
-            const file = e.target.files?.[0];
-            if (file) handleFile(file);
-            e.target.value = '';
-          }}
-        />
+    <div>
+      <div className="page-header">
+        <div>
+          <h1>DST &amp; Transfer Tax Review</h1>
+          <p className="page-subtitle">Fill in the template, upload it, and download the computed workbook.</p>
+        </div>
       </div>
 
-      {busy && <p className="muted">Computing…</p>}
-      {error && <div className="callout callout-error">{error}</div>}
-      {resultUrl && (
-        <div className="callout" style={{ background: '#dcfce7', color: '#166534' }}>
-          <p style={{ margin: '0 0 8px' }}>
-            Done. Rows with "Zonal Match Notes" filled in had no matching Zonal Value entry (unknown tower, or no
-            rate window covers the notary date) — check those manually.
-          </p>
-          <a className="btn btn-primary" href={resultUrl} download={OUTPUT_FILENAME}>
-            ⬇ Download Computed File
+      <div className="card">
+        <div className="card-header" style={{ marginBottom: 0 }}>
+          <div>
+            <h3 className="card-title">Step 1 — Download the template</h3>
+            <p className="card-subtitle">
+              Fill in Contract Number, Tower, Unit/Storage Area, Parking Area, CTS Notary Date, TCP (net of VAT), and FMV
+              per Tax Declaration.
+            </p>
+          </div>
+          <a className="btn" href={dstTransferTaxTemplateUrl()}>
+            <Icon name="download" /> Download template
           </a>
         </div>
-      )}
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <div>
+            <h3 className="card-title">Step 2 — Upload the filled-in file</h3>
+            <p className="card-subtitle">
+              RDO, Tagging, and Unit/Storage &amp; Parking ZV/sqm are traced from the tax team's Zonal Value reference as of
+              each row's CTS Notary Date (the same lookup used on a contract's detail page). Total ZV Unit/Storage, Total ZV
+              Parking, and Total ZV are real Excel formulas, so you can audit the math directly in the downloaded workbook.
+            </p>
+          </div>
+        </div>
+
+        <FileDropzone
+          accept=".xlsx,.xls"
+          disabled={busy}
+          title={busy ? 'Computing…' : 'Drop the filled-in template here'}
+          hint=".xlsx or .xls"
+          onFile={handleFile}
+        />
+
+        {busy && (
+          <div className="loading" style={{ padding: '4px 0 0' }}>
+            <span className="spinner" /> Computing…
+          </div>
+        )}
+        {error && (
+          <div className="callout callout-error" style={{ marginBottom: 0 }}>
+            {error}
+          </div>
+        )}
+        {resultUrl && (
+          <div className="callout callout-success" style={{ marginBottom: 0 }}>
+            <p>
+              <strong>Done.</strong> Rows with "Zonal Match Notes" filled in had no matching Zonal Value entry (unknown
+              tower, or no rate window covers the notary date) — check those manually.
+            </p>
+            <a className="btn" href={resultUrl} download={OUTPUT_FILENAME}>
+              <Icon name="download" /> Download computed file
+            </a>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

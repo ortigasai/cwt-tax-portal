@@ -1,11 +1,15 @@
 import { Contract, CwtCollectionEvent, PaymentRecord, RptTowerRecord } from '../generated/prisma';
 import { findRdoForTower } from '../lib/rdoLocations';
+import { nonCurrentClearingDocs } from '../lib/clearingSeries';
+import { REVIEWED_LEDGER_PREFIX } from './reviewedLedgers';
 import {
+  BuyerClassification,
   computeExposure,
   ContractComputationInput,
   ExposureResult,
   normalizeBuyerClassification,
   normalizeTaxTagging,
+  TaxTagging,
 } from './computation';
 
 export type ContractWithRelations = Contract & {
@@ -36,10 +40,30 @@ function deriveClassificationAndTagging(events: CwtCollectionEvent[]): {
   };
 }
 
-export function buildComputationInput(contract: ContractWithRelations): ContractComputationInput {
+// What-if overrides on top of a contract's stored data — used by the ETB
+// Calculator, which treats every uploaded buyer as ETB (from an optional start
+// date) without touching the contract's own stored classification.
+export interface ComputationOverride {
+  buyerClassification?: BuyerClassification;
+  taxTagging?: TaxTagging;
+  etbStartDate?: Date | null;
+}
+
+// The ETB Calculator's override: whatever the contract is stored as (Individual
+// / Corporation, Installment / Cash Deferred / AR Sale / untagged), compute it
+// as an ETB buyer on installment terms.
+export function etbOverride(etbStartDate: Date | null): ComputationOverride {
+  return { buyerClassification: 'ETB', taxTagging: 'INSTALLMENT', etbStartDate };
+}
+
+export function buildComputationInput(
+  contract: ContractWithRelations,
+  override?: ComputationOverride,
+): ContractComputationInput {
   const { buyerClassification, taxTagging } = deriveClassificationAndTagging(contract.collectionEvents);
 
   return {
+    etbStartDate: override?.etbStartDate ?? null,
     netTCP: toNumber(contract.netTCP),
     fmvPerTaxDeclarationUnit: contract.matchedRptRecord ? toNumber(contract.matchedRptRecord.fairMarketValue) : null,
     fmvPerTaxDeclarationParking: contract.matchedParkingRptRecord
@@ -53,8 +77,8 @@ export function buildComputationInput(contract: ContractWithRelations): Contract
     sqmUnit: toNumber(contract.sqmUnit),
     sqmParking: toNumber(contract.sqmParking),
     sqmStorage: toNumber(contract.sqmStorage),
-    buyerClassification: normalizeBuyerClassification(buyerClassification),
-    taxTagging: normalizeTaxTagging(taxTagging),
+    buyerClassification: override?.buyerClassification ?? normalizeBuyerClassification(buyerClassification),
+    taxTagging: override?.taxTagging ?? normalizeTaxTagging(taxTagging),
     manualDeadlineOverride: null,
     paymentRecords: contract.paymentRecords.map((p) => ({
       paymentDate: p.paymentDate,
@@ -72,15 +96,57 @@ export function buildComputationInput(contract: ContractWithRelations): Contract
       sourceTaxBase: toNumber(e.sourceTaxBase),
       baseContract: e.baseContract,
       contractNumberRaw: e.contractNumberRaw,
+      remarks: e.remarks,
     })),
   };
 }
 
-export function computeContractExposure(contract: ContractWithRelations, asOfDate: Date = new Date()): ExposureResult {
-  return computeExposure(buildComputationInput(contract), asOfDate);
+export function computeContractExposure(
+  contract: ContractWithRelations,
+  asOfDate: Date = new Date(),
+  override?: ComputationOverride,
+): ExposureResult {
+  return computeExposure(buildComputationInput(contract, override), asOfDate);
 }
 
-export function deriveDisplayFields(contract: ContractWithRelations): {
+// Is the analysis of this contract finished, i.e. is everything the CWT
+// computation needs on file so its payment ledger can be downloaded?
+//   DONE         — ledger (latest 14-series, from Reviewed & Accepted), 1606
+//                  remittances, CTS notary date and unit SQM are all in.
+//   PROVISIONAL  — all of that is in, but the ledger did not come from
+//                  Reviewed & Accepted (a SharePoint/local file), so Tax has
+//                  not accepted it yet.
+//   PENDING      — something is still missing (listed in `missing`).
+export interface AnalysisState {
+  state: 'DONE' | 'PROVISIONAL' | 'PENDING';
+  missing: string[];
+  ledgerReviewed: boolean;
+}
+
+export function deriveAnalysis(contract: ContractWithRelations): AnalysisState {
+  const missing: string[] = [];
+  const rows = contract.paymentRecords.filter((p) => !p.isSubtotal);
+  const ledgerReviewed = (contract.customerLedgerFileName ?? '').startsWith(REVIEWED_LEDGER_PREFIX);
+
+  if (rows.length === 0) missing.push('Payment ledger');
+  else if (nonCurrentClearingDocs(rows.map((p) => p.clearingDocument)).length > 0) {
+    missing.push('Latest ledger (clearing documents not in the 14 series)');
+  }
+  if (contract.collectionEvents.length === 0) missing.push('1606 remittances');
+  if (!contract.ctsNotaryDate) missing.push('CTS notary date');
+  if (!contract.sqmUnit) missing.push('Unit SQM');
+
+  return {
+    state: missing.length > 0 ? 'PENDING' : ledgerReviewed ? 'DONE' : 'PROVISIONAL',
+    missing,
+    ledgerReviewed,
+  };
+}
+
+export function deriveDisplayFields(
+  contract: ContractWithRelations,
+  override?: ComputationOverride,
+): {
   buyerClassification: string | null;
   taxTagging: string | null;
   fmvPerTaxDeclarationUnit: number | null;
@@ -90,8 +156,8 @@ export function deriveDisplayFields(contract: ContractWithRelations): {
 } {
   const { buyerClassification, taxTagging } = deriveClassificationAndTagging(contract.collectionEvents);
   return {
-    buyerClassification,
-    taxTagging,
+    buyerClassification: override?.buyerClassification ?? buyerClassification,
+    taxTagging: override?.taxTagging ?? taxTagging,
     fmvPerTaxDeclarationUnit: contract.matchedRptRecord ? toNumber(contract.matchedRptRecord.fairMarketValue) : null,
     fmvPerTaxDeclarationParking: contract.matchedParkingRptRecord
       ? toNumber(contract.matchedParkingRptRecord.fairMarketValue)

@@ -22,33 +22,36 @@ export default function LoginPage({ onSuccess }: { onSuccess: () => void }) {
   }
 
   return (
-    <div
-      style={{
-        minHeight: '100vh',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-      }}
-    >
-      <form className="card" style={{ width: 340 }} onSubmit={handleSubmit}>
-        <h2 style={{ marginTop: 0 }}>CWT Tax Exposure Portal</h2>
+    <div className="login-wrap">
+      <form className="login-card" onSubmit={handleSubmit}>
+        <div className="login-brand">
+          <span className="app-brand-mark">PO</span>
+          <h1>Pre-ONETT</h1>
+        </div>
         <p className="muted">Sign in with the shared tax team credentials.</p>
         {error && <div className="callout callout-error">{error}</div>}
         <div className="field">
-          <label>Username</label>
-          <input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus autoComplete="username" />
+          <label htmlFor="login-username">Username</label>
+          <input
+            id="login-username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoFocus
+            autoComplete="username"
+          />
         </div>
         <div className="field">
-          <label>Password</label>
+          <label htmlFor="login-password">Password</label>
           <input
+            id="login-password"
             type="password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             autoComplete="current-password"
           />
         </div>
-        <button className="btn" type="submit" disabled={submitting} style={{ width: '100%', marginTop: 8 }}>
-          {submitting ? 'Signing in…' : 'Sign In'}
+        <button className="btn" type="submit" disabled={submitting}>
+          {submitting ? 'Signing in…' : 'Sign in'}
         </button>
       </form>
     </div>

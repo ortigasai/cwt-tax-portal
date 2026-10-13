@@ -3,15 +3,19 @@ import { Link, NavLink, Route, Routes, useLocation } from 'react-router-dom';
 import Dashboard from './pages/Dashboard';
 import ContractDetailPage from './pages/ContractDetailPage';
 import UploadPage from './pages/UploadPage';
+import EtbCalculatorPage from './pages/EtbCalculatorPage';
+import EtbDashboardPage from './pages/EtbDashboardPage';
 import ReferenceDataPage from './pages/ReferenceDataPage';
 import DstTransferTaxPage from './pages/DstTransferTaxPage';
 import LoginPage from './pages/LoginPage';
+import Icon from './components/Icon';
 import { checkAuth, logout, setUnauthorizedHandler } from './api/client';
 
-// Two separate modules, each with its own sub-nav — "DST & Transfer Tax
-// Review" is a distinct tool from the CWT Portal (contracts/ledgers/zonal
-// lookups), not just another page alongside it.
+// Three separate modules, each with its own sub-nav — "DST & Transfer Tax
+// Review" and the "ETB Calculator" are distinct tools from the CWT Portal
+// (contracts/ledgers/zonal lookups), not just more pages alongside it.
 const DST_TRANSFER_TAX_PREFIX = '/dst-transfer-tax';
+const ETB_PREFIX = '/etb';
 
 function App() {
   const [authState, setAuthState] = useState<'checking' | 'in' | 'out'>('checking');
@@ -27,25 +31,42 @@ function App() {
     setAuthState('out');
   }
 
-  if (authState === 'checking') return null;
+  if (authState === 'checking') {
+    return (
+      <div className="loading" style={{ minHeight: '100vh' }}>
+        <span className="spinner" /> Loading…
+      </div>
+    );
+  }
   if (authState === 'out') return <LoginPage onSuccess={() => setAuthState('in')} />;
 
   const inDstModule = location.pathname.startsWith(DST_TRANSFER_TAX_PREFIX);
+  const inEtbModule = location.pathname.startsWith(ETB_PREFIX);
+  const inCwtModule = !inDstModule && !inEtbModule;
 
   return (
     <div className="app-shell">
       <header className="app-header">
+        <div className="app-brand">
+          <span className="app-brand-mark">PO</span>
+          <span>Pre-ONETT</span>
+        </div>
         <div className="app-modules">
-          <Link to="/" className={inDstModule ? undefined : 'active'}>
+          <Link to="/" className={inCwtModule ? 'active' : undefined}>
             CWT Portal
           </Link>
           <Link to={DST_TRANSFER_TAX_PREFIX} className={inDstModule ? 'active' : undefined}>
             DST &amp; Transfer Tax Review
           </Link>
+          <Link to={ETB_PREFIX} className={inEtbModule ? 'active' : undefined}>
+            ETB Calculator
+          </Link>
         </div>
-        <button className="btn btn-secondary" onClick={handleLogout} style={{ marginLeft: 'auto' }}>
-          Log Out
-        </button>
+        <div className="app-header-actions">
+          <button className="btn btn-ghost-light btn-sm" onClick={handleLogout}>
+            <Icon name="logout" /> Log out
+          </button>
+        </div>
       </header>
       <div className="app-subheader">
         {inDstModule ? (
@@ -53,6 +74,13 @@ function App() {
             <NavLink to={DST_TRANSFER_TAX_PREFIX} end>
               DST &amp; Transfer Tax Review
             </NavLink>
+          </nav>
+        ) : inEtbModule ? (
+          <nav>
+            <NavLink to={ETB_PREFIX} end>
+              ETB Dashboard
+            </NavLink>
+            <NavLink to={`${ETB_PREFIX}/calculator`}>New Calculation</NavLink>
           </nav>
         ) : (
           <nav>
@@ -69,6 +97,8 @@ function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/contracts/:contractNumber" element={<ContractDetailPage />} />
           <Route path="/upload" element={<UploadPage />} />
+          <Route path={ETB_PREFIX} element={<EtbDashboardPage />} />
+          <Route path={`${ETB_PREFIX}/calculator`} element={<EtbCalculatorPage />} />
           <Route path="/reference" element={<ReferenceDataPage />} />
           <Route path={DST_TRANSFER_TAX_PREFIX} element={<DstTransferTaxPage />} />
         </Routes>

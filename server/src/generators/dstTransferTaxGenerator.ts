@@ -18,7 +18,7 @@ const TEMPLATE_HEADERS = [
 
 export async function generateDstTransferTaxTemplate(): Promise<Buffer> {
   const wb = new ExcelJS.Workbook();
-  wb.creator = 'CWT Tax Exposure Portal';
+  wb.creator = 'Pre-ONETT';
   wb.created = new Date();
   const sheet = wb.addWorksheet('DST & Transfer Tax');
   sheet.columns = TEMPLATE_HEADERS.map((h) => ({ header: h, width: Math.max(18, h.length + 2) }));
@@ -84,7 +84,7 @@ function writeGroupBand(sheet: ExcelJS.Worksheet, label: string, firstCol: numbe
 
 export async function generateDstTransferTaxComputation(rows: DstTransferTaxComputedRow[]): Promise<Buffer> {
   const wb = new ExcelJS.Workbook();
-  wb.creator = 'CWT Tax Exposure Portal';
+  wb.creator = 'Pre-ONETT';
   wb.created = new Date();
   const sheet = wb.addWorksheet('DST & Transfer Tax');
   sheet.columns = OUTPUT_HEADERS.map((h) => ({ width: Math.max(16, h.length + 2) }));

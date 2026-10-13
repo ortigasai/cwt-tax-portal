@@ -1,4 +1,6 @@
-export type ExposureStatus = 'MISSING_DATA' | 'COMPLIANT' | 'UNDER_REMITTED';
+// NON_COMPLIANT: the totals tie out but a penalty was still computed on a late
+// payment — any computed penalty means the contract is not compliant.
+export type ExposureStatus = 'MISSING_DATA' | 'COMPLIANT' | 'UNDER_REMITTED' | 'NON_COMPLIANT';
 
 export interface SyncSummary {
   ranAt: string;
@@ -18,6 +20,110 @@ export interface SyncSummary {
 export interface SyncStatus {
   dataDir: string;
   last: SyncSummary | null;
+}
+
+// What uploading a contract list retrieved, for just those contracts.
+export interface UploadIntakeSummary {
+  ledgersLoaded: string[];
+  ledgersNotFound: string[];
+  ledgersFromReviewed?: string[];
+  ledgersNotReviewed?: string[];
+  ledgersNotLatest?: LedgerNotLatestInfo[];
+  ledgersNotFoundAdvice?: { contractNumber: string; advice: string }[];
+  oclp: { refreshedFromSharePoint: boolean; matchedRows: number | null };
+  ctsFetched: string[];
+  ctsOnFile: string[];
+  ctsDataFilled: CtsDataFill[];
+  ctsDataComplete: string[];
+  errors: string[];
+}
+
+export interface CtsDataFill {
+  contractNumber: string;
+  fields: string[];
+  batchName: string;
+}
+
+export interface EtbLine {
+  paymentDate: string | null;
+  principal: number | null;
+  totalCollection: number | null;
+  applicableDeadline: string | null;
+  shouldBeCwtDue: number | null;
+  cwtFileTaxDue: number | null;
+  difference: number | null;
+  totalDue: number | null;
+  beforeEtbStart: boolean;
+  coveredByBulkRemittance: boolean;
+  paidInAdvance: boolean;
+}
+
+export interface AnalysisState {
+  state: 'DONE' | 'PROVISIONAL' | 'PENDING';
+  missing: string[];
+  ledgerReviewed: boolean;
+}
+
+export interface EtbContractResult {
+  contractNumber: string;
+  analysis: AnalysisState;
+  buyerName: string | null;
+  tower: string | null;
+  unit: string | null;
+  storedClassification: string | null;
+  taxTagging: string | null;
+  ctsNotaryDate: string | null;
+  netTCP: number | null;
+  cwtTaxBase: number | null;
+  taxBaseSource: string | null;
+  cwtTaxDue: number | null;
+  actualRemitted: number;
+  variance: number | null;
+  status: ExposureStatus;
+  totalPenalties: number | null;
+  primaryDeadline: string | null;
+  deadlineNote: string;
+  deadlineCount: number;
+  paymentCount: number;
+  paymentsBeforeStart: number;
+  lines: EtbLine[];
+}
+
+// One saved ETB calculation (a row on the ETB Dashboard).
+export interface EtbRunSummary {
+  id: number;
+  title: string;
+  customTitle: string | null;
+  filename: string;
+  startDate: string | null;
+  contractCount: number;
+  createdAt: string;
+}
+
+export interface EtbRunDetail {
+  run: EtbRunSummary;
+  startDate: string | null;
+  // Contracts in the run that have since been deleted from the portal.
+  missing: string[];
+  results: EtbContractResult[];
+}
+
+export interface EtbComputeResponse {
+  runId?: number;
+  runTitle?: string;
+  startDate: string | null;
+  totalFound: number;
+  created: number;
+  retrievedFor: number;
+  ctsFilled: number;
+  errors: string[];
+  results: EtbContractResult[];
+}
+
+export interface CtsDataResult {
+  filled: CtsDataFill[];
+  notFound: string[];
+  errors: string[];
 }
 
 export interface SharePointUpdateSummary {
@@ -84,7 +190,32 @@ export interface ContractSummary {
   totalPenalties: number;
   status: ExposureStatus;
   batchNumber: number | null;
+  batchTitle: string | null;
   batchDate: string | null;
+  // Payment rows whose clearing document is outside the "14" series — non-zero
+  // means the ledger on file is not LedgerFit's latest corrected ledger.
+  nonCurrentClearingDocs?: number;
+  // Is the analysis done (everything needed is on file), so the payment ledger
+  // can be downloaded? PROVISIONAL = ready but the ledger isn't Tax-accepted yet.
+  analysis?: { state: 'DONE' | 'PROVISIONAL' | 'PENDING'; missing: string[]; ledgerReviewed: boolean };
+}
+
+export interface LedgerSeriesCheck {
+  isLatest: boolean;
+  nonCurrentCount: number;
+  sample: string[];
+  advice: string | null;
+  ledgerfitSessionId: string | null;
+}
+
+export interface LedgerNotLatestInfo {
+  contractNumber: string;
+  fileName: string;
+  nonCurrentDocs: number;
+  sample: string[];
+  ledgerfitSessionId: string | null;
+  ledgerfitStatus: string | null;
+  advice: string;
 }
 
 export interface DeadlineEntry {
@@ -125,6 +256,10 @@ export interface PerPaymentLine {
   difference: number | null;
   penalties: PenaltyBreakdown | null;
   totalDue: number | null;
+  // After an AR Sale bulk CWT remittance — no CWT due or penalty of its own.
+  coveredByBulkRemittance?: boolean;
+  // CWT remitted by this row's deadline already covered everything due through it.
+  paidInAdvance?: boolean;
 }
 
 export type TaxBaseSource = 'NET_TCP' | 'FMV_PER_TAX_DECLARATION' | 'ZONAL_VALUE';
@@ -177,6 +312,7 @@ export interface RptTowerRecord {
 }
 
 export interface ContractDetail {
+  ledgerSeries?: LedgerSeriesCheck;
   contractNumber: string;
   buyerName: string | null;
   estate: string | null;

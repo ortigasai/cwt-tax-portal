@@ -19,8 +19,10 @@
 //    VAT-exclusive principal — trusting the ledger's own recorded Payment
 //    Principal (real data shows some rows don't follow a clean 12% VAT
 //    split), falling back to Total Collection / 1.12 only when no principal
-//    was recorded. This also applies to the reservation fee once it's
-//    folded into the 1st downpayment.
+//    was recorded. Every payment — including the first and second — is
+//    computed this same way, on its own; there is no special treatment of a
+//    "reservation fee" row (the current LedgerFit ledger already splits
+//    principal and VAT correctly on those rows).
 
 export type BuyerClassification = 'INDIVIDUAL' | 'ETB' | 'CORPORATION' | 'UNKNOWN';
 export type TaxTagging = 'INSTALLMENT' | 'CASH_DEFERRED' | 'AR_SALE' | 'UNKNOWN';
@@ -48,6 +50,9 @@ export interface CollectionEventInput {
   // the 1606 file — can differ from the contract's own number when this is
   // a previous buyer's remittance pulled in via baseContract matching.
   contractNumberRaw?: string | null;
+  // The 1606 file's REMARKS column. "AR SALE" marks a bulk remittance of the
+  // whole contract's CWT — see arSaleBulkRemittanceDate.
+  remarks?: string | null;
 }
 
 export interface ContractComputationInput {
@@ -65,6 +70,9 @@ export interface ContractComputationInput {
   buyerClassification: BuyerClassification;
   taxTagging: TaxTagging;
   manualDeadlineOverride: Date | null;
+  // When set (ETB Calculator), only payments on/after this date carry a
+  // per-collection ETB obligation. Leave unset for the normal computation.
+  etbStartDate?: Date | null;
   paymentRecords: PaymentRecordInput[];
   collectionEvents: CollectionEventInput[];
 }
@@ -121,9 +129,9 @@ export interface PerPaymentLine {
   // paid to compare.
   remittedInDeadlineMonth: boolean | null;
   // Should-Be CWT Due minus CWT File Tax Due — a simple per-row variance,
-  // not a cumulative/reconciled figure. Null for the reservation fee row
-  // (it never carries its own should-be due) and whenever either side is
-  // missing.
+  // not a cumulative/reconciled figure. Null whenever the row has no
+  // should-be due of its own (e.g. an earlier row in a month that shares
+  // its obligation with a later one) or either side is missing.
   difference: number | null;
   // Per-row penalties (Section 6.3), computed only when `difference` shows
   // a shortfall (Should-Be CWT Due > CWT File Tax Due) exceeding the
@@ -135,6 +143,12 @@ export interface PerPaymentLine {
   // whenever there are no penalties (no exposure on this row, or nothing to
   // compare), matching the same gating as `penalties`.
   totalDue: number | null;
+  // True when this payment falls after an AR Sale bulk CWT remittance, so it
+  // carries no CWT due or penalty of its own (see arSaleBulkRemittanceDate).
+  coveredByBulkRemittance: boolean;
+  // True when the CWT remitted by this row's deadline already covered
+  // everything due through it (paid in advance) — see applySettlement.
+  paidInAdvance: boolean;
 }
 
 export type TaxBaseSource = 'NET_TCP' | 'FMV_PER_TAX_DECLARATION' | 'ZONAL_VALUE';
@@ -147,9 +161,15 @@ export interface ExposureResult {
   cwtTaxDue: number | null;
   actualRemitted: number;
   variance: number | null;
-  status: 'MISSING_DATA' | 'COMPLIANT' | 'UNDER_REMITTED';
+  // UNDER_REMITTED: total remitted is short of the CWT due. NON_COMPLIANT: the
+  // total ties out, but a penalty was still computed on one or more payments
+  // (remitted late). Any computed penalty means the contract is not compliant.
+  status: 'MISSING_DATA' | 'COMPLIANT' | 'UNDER_REMITTED' | 'NON_COMPLIANT';
   deadline: DeadlineResult;
   penalties: PenaltyBreakdown | null;
+  // Sum of the penalties computed on individual payment rows — what makes a
+  // contract NON_COMPLIANT when `penalties` (contract-level) is null.
+  rowPenaltiesTotal: number;
   perPaymentLines: PerPaymentLine[];
 }
 
@@ -199,15 +219,27 @@ function triggerablePayments(records: PaymentRecordInput[]): PaymentRecordInput[
     .sort((a, b) => a.paymentDate!.getTime() - b.paymentDate!.getTime());
 }
 
-// A round-thousands amount (25,000.00, 100,000.00, 250,000.00, ...) as the
-// very first collection is almost always a reservation fee, not an
-// amortization payment.
-function looksLikeReservationFee(amount: number): boolean {
-  return amount > 0 && Math.round(amount) % 1000 === 0;
-}
-
 const CWT_RATE = 0.05;
 const EXPOSURE_ROUNDING_TOLERANCE = 1.0;
+
+// A 1606 row whose REMARKS say "AR SALE" is the contract's CWT remitted in
+// bulk, ahead of the remaining amortization — the buyer's later payments
+// don't generate any further CWT. Returns the latest such remittance's date
+// (its transaction date, falling back to date paid, i.e. the same anchor the
+// month matching uses): payments dated after it are already covered and carry
+// no should-be CWT due, deadline or penalty. Null when there is none.
+const AR_SALE_REMARK = /^\s*a\/?r[\s-]*sale\s*$/i;
+
+export function arSaleBulkRemittanceDate(events: CollectionEventInput[]): Date | null {
+  let latest: Date | null = null;
+  for (const e of events) {
+    if (!e.remarks || !AR_SALE_REMARK.test(e.remarks)) continue;
+    if (!e.actualTaxDue || e.actualTaxDue <= 0) continue;
+    const anchor = e.transactionDate ?? e.datePaid;
+    if (anchor && (!latest || anchor > latest)) latest = anchor;
+  }
+  return latest;
+}
 
 // Total Collection is VAT-inclusive (Principal x 1.12, since VAT = Principal
 // x 12%); CWT is computed on the VAT-exclusive principal.
@@ -224,33 +256,30 @@ function principalBasis(row: PaymentRecordInput): number {
   return row.paymentPrincipal ?? netOfVat(row.totalCollection!);
 }
 
-// The ordered list of rows that will each generate their own deadline entry
-// for ETB/Corporation + Installment, after folding a reservation fee (if
-// any) into the 1st downpayment. Shared by computeDeadline and
-// computePerPaymentLines — both call this and get the identical array (same
-// object references, same order), so entries stay correctly matched to
-// their originating row via array position even when multiple rows share
-// the same payment date. See the module-level note (4) for why the
-// reservation fee's own principal isn't trusted while the 1st downpayment's
-// is: source ledgers book the full reservation fee as principal with zero
-// VAT, but individual installment rows can (and do) have irregular splits
-// that must be taken as booked.
-function etbInstallmentObligationRows(paymentRecords: PaymentRecordInput[]): {
-  rows: PaymentRecordInput[];
-  basisOverrides: Map<PaymentRecordInput, number>;
-  mergeNote: string | null;
-  reservationFeeRow: PaymentRecordInput | null;
-} {
-  const triggerable = triggerablePayments(paymentRecords);
-  if (triggerable.length < 2 || !looksLikeReservationFee(triggerable[0].totalCollection ?? 0)) {
-    return { rows: triggerable, basisOverrides: new Map(), mergeNote: null, reservationFeeRow: null };
-  }
-  const [reservationFee, firstDownpayment, ...rest] = triggerable;
-  const reservationFeeNet = round2(netOfVat(reservationFee.totalCollection!));
-  const combinedBasis = round2(reservationFeeNet + principalBasis(firstDownpayment));
-  const basisOverrides = new Map([[firstDownpayment, combinedBasis]]);
-  const mergeNote = `includes reservation fee of ${reservationFee.totalCollection} (net of VAT: ${reservationFeeNet}) collected on ${formatMDY(reservationFee.paymentDate!)}`;
-  return { rows: [firstDownpayment, ...rest], basisOverrides, mergeNote, reservationFeeRow: reservationFee };
+// The ordered list of rows that each generate their own deadline entry for
+// ETB/Corporation + Installment: every dated, non-subtotal, non-zero payment
+// in chronological order, each on its own principal x 5%. The first and
+// second payments are treated exactly like the third onward — no folding of
+// a "reservation fee" into the 1st downpayment. Shared by computeDeadline
+// and computePerPaymentLines — both get the identical array (same object
+// references, same order), so entries stay correctly matched to their
+// originating row via array position even when multiple rows share the
+// same payment date.
+//
+// `etbStartDate` (ETB Calculator only; null/undefined everywhere else): the
+// date the buyer's ETB status begins. Only payments dated on or after it
+// become per-collection obligations — earlier payments get no ETB deadline.
+// `coveredThrough` (an AR Sale bulk remittance date): payments after it are
+// already covered and drop out as well.
+function etbInstallmentObligationRows(
+  paymentRecords: PaymentRecordInput[],
+  etbStartDate?: Date | null,
+  coveredThrough?: Date | null,
+): PaymentRecordInput[] {
+  let rows = triggerablePayments(paymentRecords);
+  if (etbStartDate) rows = rows.filter((r) => r.paymentDate!.getTime() >= etbStartDate.getTime());
+  if (coveredThrough) rows = rows.filter((r) => r.paymentDate!.getTime() <= coveredThrough.getTime());
+  return rows;
 }
 
 // The single row whose payment date anchors the deadline for Individual +
@@ -470,21 +499,31 @@ export function computeDeadline(input: ContractComputationInput): DeadlineResult
   }
 
   if (tag === 'INSTALLMENT' && (bc === 'ETB' || bc === 'CORPORATION')) {
-    const { rows, basisOverrides, mergeNote } = etbInstallmentObligationRows(paymentRecords);
+    const bulkDate = arSaleBulkRemittanceDate(input.collectionEvents);
+    const rows = etbInstallmentObligationRows(paymentRecords, input.etbStartDate, bulkDate);
     if (rows.length === 0) {
-      return { entries: [], primaryDeadline: null, note: 'No payment records found to schedule per-collection deadlines.' };
+      return {
+        entries: [],
+        primaryDeadline: null,
+        note: bulkDate
+          ? `The CWT was remitted in bulk (AR Sale) on ${formatMDY(bulkDate)} — no payment on or before that date carries a per-collection obligation, and later payments are already covered.`
+          : input.etbStartDate
+          ? `No payment on or after the ETB start date (${formatMDY(input.etbStartDate)}) — no per-collection deadlines to schedule.`
+          : 'No payment records found to schedule per-collection deadlines.',
+      };
     }
-    const entries: DeadlineEntry[] = rows.map((r, i) => ({
+    const entries: DeadlineEntry[] = rows.map((r) => ({
       date: addMonthsTenth(r.paymentDate!),
-      basisAmount: round2((basisOverrides.get(r) ?? principalBasis(r)) * CWT_RATE),
-      description:
-        `10th day of month following collection on ${formatMDY(r.paymentDate!)}` +
-        (i === 0 && mergeNote ? ` (${mergeNote})` : ''),
+      basisAmount: round2(principalBasis(r) * CWT_RATE),
+      description: `10th day of month following collection on ${formatMDY(r.paymentDate!)}`,
     }));
+    const startNote = input.etbStartDate
+      ? `Only payments on or after the ETB start date (${formatMDY(input.etbStartDate)}) are scheduled. `
+      : '';
     return {
       entries,
       primaryDeadline: entries[0].date,
-      note: 'ETB/Corporation + Installment: CWT due EACH payment date on the VAT-exclusive principal; primary deadline uses FIFO aging of unmet obligations. A round-thousands first payment is treated as a reservation fee and folded into the 1st downpayment for CWT purposes.',
+      note: startNote + 'ETB/Corporation + Installment: CWT due EACH payment date on the VAT-exclusive principal (the first and second payments included, computed the same way as every other payment); primary deadline uses FIFO aging of unmet obligations.',
     };
   }
 
@@ -555,7 +594,120 @@ export function computePenalties(variance: number, deadline: Date | null, asOfDa
 // remittances aren't reliably attributable to one specific collection;
 // overall compliance is judged at the contract level (see computeExposure's
 // `status`/`variance`).
+// Settling each payment's CWT against the remittances actually made.
+//
+// The month-by-month 1606 matching above only ties a remittance to a payment
+// when they fall in the same calendar month, and the penalty clock used to run
+// to today regardless. Here every remittance is applied, oldest first, to the
+// oldest unpaid obligation (FIFO, by deadline), so each obligation knows how
+// much was paid, on which dates, and how much is still outstanding:
+//   - paid on or before the deadline          -> on time, no penalty (this
+//     also covers CWT paid in advance, and an AR Sale bulk remittance);
+//   - paid after the deadline                 -> late: surcharge, compromise
+//     penalty, and interest that STOPS ON THE DATE IT WAS ACTUALLY PAID;
+//   - still unpaid                            -> same penalties, with the
+//     interest running to today (the as-of date).
+// The row's `difference` becomes the amount still unpaid; the month-matched
+// CWT file columns stay as reference.
+function applySettlement(
+  lines: PerPaymentLine[],
+  events: CollectionEventInput[],
+  asOfDate: Date,
+): PerPaymentLine[] {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  const remittances = events
+    .map((e) => ({ at: (e.datePaid ?? e.transactionDate)?.getTime() ?? null, left: e.actualTaxDue ?? 0 }))
+    .filter((r): r is { at: number; left: number } => r.at !== null && r.left > 0)
+    .sort((a, b) => a.at - b.at);
+
+  // Obligations in deadline order (stable for equal deadlines).
+  const order = lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => line.shouldBeCwtDue !== null && line.applicableDeadline !== null)
+    .sort((a, b) => a.line.applicableDeadline!.getTime() - b.line.applicableDeadline!.getTime() || a.index - b.index);
+
+  const out = [...lines];
+  for (const { line, index } of order) {
+    const deadline = line.applicableDeadline!;
+    const deadlineMs = deadline.getTime();
+    // A deadline that falls on a weekend is met by paying on the next working
+    // day (Saturday/Sunday -> Monday). Public holidays are not modelled.
+    const dueDay = deadline.getUTCDay();
+    const onTimeUntilMs = deadlineMs + (dueDay === 6 ? 2 : dueDay === 0 ? 1 : 0) * msPerDay;
+    let need = line.shouldBeCwtDue!;
+    const portions: { amount: number; at: number }[] = [];
+    for (const r of remittances) {
+      if (need <= EXPOSURE_ROUNDING_TOLERANCE) break;
+      if (r.left <= 0) continue;
+      const take = Math.min(r.left, need);
+      r.left = round2(r.left - take);
+      need = round2(need - take);
+      portions.push({ amount: take, at: r.at });
+    }
+    const unpaid = need > EXPOSURE_ROUNDING_TOLERANCE ? need : 0;
+    const late = portions.filter((p) => p.at > onTimeUntilMs);
+    const lateAmount = round2(late.reduce((s, p) => s + p.amount, 0));
+    const base = round2(lateAmount + unpaid);
+
+    let penalties: PenaltyBreakdown | null = null;
+    if (base > EXPOSURE_ROUNDING_TOLERANCE) {
+      const rate = deadline < POST_2018_CUTOFF ? 0.2 : 0.12;
+      const daysTo = (ms: number) => Math.max(0, Math.floor((ms - deadlineMs) / msPerDay));
+      // Interest on each late-paid portion stops on its paid date; the
+      // unpaid remainder keeps running to today.
+      let interest = 0;
+      let daysLate = 0;
+      for (const p of late) {
+        const d = daysTo(p.at);
+        interest += p.amount * rate * (d / 365);
+        daysLate = Math.max(daysLate, d);
+      }
+      if (unpaid > 0) {
+        const d = daysTo(asOfDate.getTime());
+        interest += unpaid * rate * (d / 365);
+        daysLate = Math.max(daysLate, d);
+      }
+      const surcharge = round2(0.25 * base);
+      const compromisePenalty = compromisePenaltyFor(base);
+      const interestRounded = round2(interest);
+      penalties = {
+        surcharge,
+        compromisePenalty,
+        interest: interestRounded,
+        interestRate: rate,
+        daysLate,
+        totalPenalties: round2(surcharge + compromisePenalty + interestRounded),
+      };
+    }
+
+    // The month-matched difference could be positive (nothing filed that
+    // month) even though the CWT was paid on time elsewhere, or zero even
+    // though it was paid late: what is actually outstanding is `unpaid`.
+    const monthDiff = line.difference;
+    const difference = monthDiff !== null && monthDiff > EXPOSURE_ROUNDING_TOLERANCE ? unpaid : monthDiff;
+    out[index] = {
+      ...line,
+      difference: penalties === null && difference !== null && difference > EXPOSURE_ROUNDING_TOLERANCE ? 0 : difference,
+      penalties,
+      totalDue: penalties ? round2(unpaid + penalties.totalPenalties) : null,
+      // Settled on or before the deadline although the month match said short.
+      paidInAdvance:
+        penalties === null && monthDiff !== null && monthDiff > EXPOSURE_ROUNDING_TOLERANCE && portions.length > 0,
+    };
+  }
+  return out;
+}
+
 export function computePerPaymentLines(
+  input: ContractComputationInput,
+  deadline: DeadlineResult,
+  cwtTaxDue: number | null,
+  asOfDate: Date,
+): PerPaymentLine[] {
+  return applySettlement(buildPerPaymentLines(input, deadline, cwtTaxDue, asOfDate), input.collectionEvents, asOfDate);
+}
+
+function buildPerPaymentLines(
   input: ContractComputationInput,
   deadline: DeadlineResult,
   cwtTaxDue: number | null,
@@ -569,26 +721,36 @@ export function computePerPaymentLines(
   // applies uniformly regardless of buyer classification/tax tagging.
   const { matchByRow, unmatchedEvents } = matchCwtFileByMonth(allRows, input.collectionEvents);
 
-  // Set below, only for ETB/Corporation + Installment, when the first
-  // payment looks like a reservation fee — that row never carries its own
-  // should-be due, so Difference (and any penalties derived from it) must
-  // stay null for it rather than comparing against a stray CWT file match.
-  let reservationFeeRow: PaymentRecordInput | null = null;
+  // An AR Sale bulk remittance already paid this contract's CWT: payments
+  // dated after it have no should-be CWT, deadline or penalty of their own.
+  const bulkRemittanceDate = arSaleBulkRemittanceDate(input.collectionEvents);
+  // The ledger row the bulk remittance is matched to (the last row of its
+  // month — the same row matchCwtFileByMonth hands the 1606 entry to).
+  const bulkRow = bulkRemittanceDate
+    ? ([...allRows].reverse().find((r) => monthKey(r.paymentDate!) === monthKey(bulkRemittanceDate)) ?? null)
+    : null;
+  const totalRemitted = round2(input.collectionEvents.reduce((s, e) => s + (e.actualTaxDue ?? 0), 0));
 
-  const toLine = (row: PaymentRecordInput, shouldBeCwtDue: number | null, applicableDeadline: Date | null): PerPaymentLine => {
+  const toLine = (row: PaymentRecordInput, rawShouldBe: number | null, rawDeadline: Date | null): PerPaymentLine => {
+    const coveredByBulkRemittance =
+      row !== bulkRow &&
+      bulkRemittanceDate !== null &&
+      row.paymentDate !== null &&
+      row.paymentDate.getTime() > bulkRemittanceDate.getTime();
+    const shouldBeCwtDue = coveredByBulkRemittance ? null : rawShouldBe;
+    const applicableDeadline = coveredByBulkRemittance ? null : rawDeadline;
     const match = matchByRow.get(row);
     const datesPaid = match?.datesPaid ?? [];
     const remittedInDeadlineMonth =
       applicableDeadline && datesPaid.length > 0 ? datesPaid.some((d) => monthKey(d) === monthKey(applicableDeadline)) : null;
     const cwtFileTaxDue = match?.taxDue ?? null;
-    const isReservationFee = row === reservationFeeRow;
     // No CWT file match at all (as opposed to a match confirming exactly
     // ₱0 remitted) means we found no remittance record for this row's
     // obligation — for a tax exposure tool that must count as full
     // exposure, not be skipped, so it's treated as 0 remitted here. The
     // raw `cwtFileTaxDue` column stays null so the table still shows
     // plainly that no CWT file data was found for the row.
-    const difference = !isReservationFee && shouldBeCwtDue !== null ? round2(shouldBeCwtDue - (cwtFileTaxDue ?? 0)) : null;
+    const difference = shouldBeCwtDue !== null ? round2(shouldBeCwtDue - (cwtFileTaxDue ?? 0)) : null;
     // Per-row penalties (FS Section 6.3) — only when this row's own
     // should-be due exceeds what the CWT file shows as actually remitted.
     const penalties =
@@ -617,6 +779,8 @@ export function computePerPaymentLines(
       difference,
       penalties,
       totalDue,
+      coveredByBulkRemittance,
+      paidInAdvance: false,
     };
   };
 
@@ -641,6 +805,8 @@ export function computePerPaymentLines(
     difference: null,
     penalties: null,
     totalDue: null,
+    coveredByBulkRemittance: false,
+    paidInAdvance: false,
   }));
 
   if (allRows.length === 0 || cwtTaxDue === null || deadline.entries.length === 0) {
@@ -660,8 +826,7 @@ export function computePerPaymentLines(
     // land in the same calendar month, their amounts ARE summed onto the
     // LAST row of that month (see consolidateByMonth) — same convention as
     // every other tax-tagging rule below.
-    const { rows, reservationFeeRow: feeRow } = etbInstallmentObligationRows(paymentRecords);
-    reservationFeeRow = feeRow;
+    const rows = etbInstallmentObligationRows(paymentRecords, input.etbStartDate, bulkRemittanceDate);
     const perRow = new Map<PaymentRecordInput, { basisAmount: number; date: Date }>();
     rows.forEach((r, i) => {
       const entry = deadline.entries[i];
@@ -678,12 +843,33 @@ export function computePerPaymentLines(
     ];
   }
 
+  // Single-trigger rules (Individual + Installment, Cash Deferred): the full
+  // CWT due sits on the trigger row. When that trigger falls AFTER an AR Sale
+  // bulk remittance it is covered — but the remittance still has to tie out to
+  // the CWT due, so the (remaining) due is re-homed onto the row the bulk
+  // remittance is matched to, with the deadline of the AR Sale itself (10th of
+  // the month after the bulk transaction). Remitted in full → difference 0;
+  // short → the shortfall and its penalties show on that row.
+  const due = cwtTaxDue;
+  const dueOnRow = (row: PaymentRecordInput, trigger: PaymentRecordInput | null): [number | null, Date | null] => {
+    if (!trigger) return [null, null];
+    const triggerCovered =
+      bulkRemittanceDate !== null && trigger.paymentDate!.getTime() > bulkRemittanceDate.getTime();
+    if (triggerCovered && bulkRow && bulkRemittanceDate) {
+      if (row !== bulkRow) return [null, null];
+      const elsewhere = round2(totalRemitted - (matchByRow.get(bulkRow)?.taxDue ?? 0));
+      return [Math.max(0, round2(due - elsewhere)), addMonthsTenth(bulkRemittanceDate)];
+    }
+    return row === trigger ? [due, addMonthsTenth(row.paymentDate!)] : [null, null];
+  };
+
   if (tag === 'INSTALLMENT' && bc === 'INDIVIDUAL') {
     const trigger = individualInstallmentTriggerRow(paymentRecords);
     return [
-      ...allRows.map((row) =>
-        toLine(row, row === trigger ? cwtTaxDue : null, row === trigger ? addMonthsTenth(row.paymentDate!) : null),
-      ),
+      ...allRows.map((row) => {
+        const [shouldBe, deadlineDate] = dueOnRow(row, trigger);
+        return toLine(row, shouldBe, deadlineDate);
+      }),
       ...unmatchedLines,
     ];
   }
@@ -691,9 +877,10 @@ export function computePerPaymentLines(
   if (tag === 'CASH_DEFERRED' && netTCP !== null && netTCP > 0) {
     const trigger = cashDeferredTriggerRow(paymentRecords, netTCP);
     return [
-      ...allRows.map((row) =>
-        toLine(row, row === trigger ? cwtTaxDue : null, row === trigger ? addMonthsTenth(row.paymentDate!) : null),
-      ),
+      ...allRows.map((row) => {
+        const [shouldBe, deadlineDate] = dueOnRow(row, trigger);
+        return toLine(row, shouldBe, deadlineDate);
+      }),
       ...unmatchedLines,
     ];
   }
@@ -705,13 +892,49 @@ export function computePerPaymentLines(
 
 export function computeExposure(input: ContractComputationInput, asOfDate: Date = new Date()): ExposureResult {
   const { taxBase, zonalValueBasis, fmvPerTaxDeclarationTotal, taxBaseSource } = computeCwtTaxBase(input);
-  const deadline = computeDeadline(input);
+  const baseDeadline = computeDeadline(input);
+  const bulkDate = arSaleBulkRemittanceDate(input.collectionEvents);
 
   const cwtTaxDue = taxBase !== null ? round2(taxBase * CWT_RATE) : null;
   const actualRemitted = round2(
     input.collectionEvents.reduce((sum, e) => sum + (e.actualTaxDue ?? 0), 0),
   );
-  const perPaymentLines = computePerPaymentLines(input, deadline, cwtTaxDue, asOfDate);
+  const perPaymentLines = computePerPaymentLines(input, baseDeadline, cwtTaxDue, asOfDate);
+  const rowPenaltiesTotal = round2(perPaymentLines.reduce((s, l) => s + (l.penalties?.totalPenalties ?? 0), 0));
+
+  // AR Sale: payments after the bulk remittance carry no CWT of their own, but
+  // the remittance must still tie out to the CWT due — spell the tie-out out,
+  // and if it is short, the penalties run from the AR Sale's own deadline
+  // (10th of the month after the bulk transaction) when that is earlier.
+  let deadline: DeadlineResult = baseDeadline;
+  if (bulkDate) {
+    const money = (n: number) => `₱${n.toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    let tieOut = '';
+    let primaryDeadline = baseDeadline.primaryDeadline;
+    if (cwtTaxDue !== null) {
+      const gap = round2(cwtTaxDue - actualRemitted);
+      if (gap > EXPOSURE_ROUNDING_TOLERANCE) {
+        const arDeadline = addMonthsTenth(bulkDate);
+        if (!primaryDeadline || arDeadline < primaryDeadline) primaryDeadline = arDeadline;
+        tieOut = ` Tie-out: remitted ${money(actualRemitted)} vs CWT due ${money(cwtTaxDue)} — SHORT by ${money(gap)}; flagged under-remitted, penalties counted from ${formatMDY(arDeadline)} (10th of the month after the AR Sale).`;
+      } else {
+        tieOut = ` Tie-out: remitted ${money(actualRemitted)} vs CWT due ${money(cwtTaxDue)} — tied.`;
+      }
+    }
+    deadline = {
+      ...baseDeadline,
+      primaryDeadline,
+      note: `${baseDeadline.note} AR Sale: the CWT was remitted in bulk on ${formatMDY(bulkDate)} (1606 remarks), so payments after that date carry no CWT due or penalty of their own.${tieOut}`,
+    };
+  }
+
+  const advanceCount = perPaymentLines.filter((l) => l.paidInAdvance).length;
+  if (advanceCount > 0) {
+    deadline = {
+      ...deadline,
+      note: `${deadline.note} CWT remitted in advance already covered ${advanceCount} payment(s) — no shortfall or penalty on those rows.`,
+    };
+  }
 
   if (cwtTaxDue === null) {
     return {
@@ -725,6 +948,7 @@ export function computeExposure(input: ContractComputationInput, asOfDate: Date 
       status: 'MISSING_DATA',
       deadline,
       penalties: null,
+      rowPenaltiesTotal,
       perPaymentLines,
     };
   }
@@ -733,8 +957,12 @@ export function computeExposure(input: ContractComputationInput, asOfDate: Date 
   // Summing dozens of per-collection remittances accumulates centavo-level
   // float rounding noise; a variance this small isn't real exposure and
   // shouldn't trigger the ₱1,000 compromise-penalty minimum.
-  const status = variance > EXPOSURE_ROUNDING_TOLERANCE ? 'UNDER_REMITTED' : 'COMPLIANT';
-  const penalties = status === 'UNDER_REMITTED' ? computePenalties(variance, deadline.primaryDeadline, asOfDate) : null;
+  // Any computed penalty — on the contract as a whole, or on a single payment
+  // that was remitted late — means the contract is not compliant.
+  const status: ExposureResult['status'] =
+    variance > EXPOSURE_ROUNDING_TOLERANCE ? 'UNDER_REMITTED' : rowPenaltiesTotal > 0 ? 'NON_COMPLIANT' : 'COMPLIANT';
+  const penalties =
+    status === 'UNDER_REMITTED' ? computePenalties(variance, deadline.primaryDeadline, asOfDate) : null;
 
   return {
     cwtTaxBase: taxBase,
@@ -747,6 +975,7 @@ export function computeExposure(input: ContractComputationInput, asOfDate: Date 
     status,
     deadline,
     penalties,
+    rowPenaltiesTotal,
     perPaymentLines,
   };
 }

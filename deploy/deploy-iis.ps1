@@ -1,4 +1,4 @@
-# Deploys the CWT Tax Exposure Portal on this Windows Server:
+﻿# Deploys Pre-ONETT (formerly the CWT Tax Exposure Portal) on this Windows Server:
 #   - builds the server (TypeScript -> dist/) and applies pending Prisma
 #     migrations against the server's own PostgreSQL
 #   - builds the client for production (relative /api calls, so it works

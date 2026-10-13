@@ -1,4 +1,16 @@
-import type { ContractDetail, ContractSummary, RptTowerRecord, SharePointUpdateSummary, SyncStatus, SyncSummary } from './types';
+import type {
+  ContractDetail,
+  CtsDataResult,
+  EtbComputeResponse,
+  EtbRunDetail,
+  EtbRunSummary,
+  ContractSummary,
+  RptTowerRecord,
+  SharePointUpdateSummary,
+  SyncStatus,
+  SyncSummary,
+  UploadIntakeSummary,
+} from './types';
 
 // Derived from the hostname the page was actually loaded from (localhost,
 // 127.0.0.1, or this machine's LAN IP) rather than a hardcoded "localhost" —
@@ -77,6 +89,17 @@ export function updateFromSharePoint(): Promise<SharePointUpdateSummary> {
   return request('/api/sync/from-sharepoint', { method: 'POST' });
 }
 
+// Fills CTS notary date / SQM / zonal value from the DOAS batches for every
+// contract still missing them (empty fields only) — see
+// server/src/services/ctsDataSync.ts.
+export function retrieveCtsData(): Promise<CtsDataResult> {
+  return request('/api/contracts/retrieve-cts-data', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+}
+
 export function fetchContract(contractNumber: string): Promise<ContractDetail> {
   return request(`/api/contracts/${encodeURIComponent(contractNumber)}`);
 }
@@ -109,10 +132,66 @@ async function uploadFile<T>(path: string, file: File): Promise<T> {
   return request(path, { method: 'POST', body: form });
 }
 
-export function uploadContractList(
-  file: File,
-): Promise<{ totalFound: number; created: number; alreadyExisted: number; syncSummary: SyncSummary }> {
+export function uploadContractList(file: File): Promise<{
+  totalFound: number;
+  created: number;
+  alreadyExisted: number;
+  batchNumber: number;
+  batchTitle: string;
+  intake: UploadIntakeSummary;
+  results: ContractSummary[];
+}> {
   return uploadFile('/api/contracts/upload-list', file);
+}
+
+// ETB Calculator: computes each listed contract as if the buyer were ETB,
+// from an optional start date (YYYY-MM-DD). See server/src/routes/etb.ts.
+export function computeEtb(file: File, startDate: string): Promise<EtbComputeResponse> {
+  const form = new FormData();
+  form.append('file', file);
+  if (startDate) form.append('startDate', startDate);
+  return request('/api/etb/compute', { method: 'POST', body: form });
+}
+
+// ETB Dashboard: saved calculations.
+export function fetchEtbRuns(): Promise<EtbRunSummary[]> {
+  return request('/api/etb/runs');
+}
+
+export function fetchEtbRun(id: number): Promise<EtbRunDetail> {
+  return request(`/api/etb/runs/${id}`);
+}
+
+export function renameEtbRun(id: number, title: string): Promise<EtbRunSummary> {
+  return request(`/api/etb/runs/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+}
+
+export function deleteEtbRun(id: number): Promise<{ deleted: number }> {
+  return request(`/api/etb/runs/${id}`, { method: 'DELETE' });
+}
+
+// ETB variant of a contract's Tax Payment Ledger export.
+export function etbLedgerDownloadUrl(contractNumber: string, startDate: string): string {
+  const query = new URLSearchParams({ etb: '1' });
+  if (startDate) query.set('etbStart', startDate);
+  return `${API_URL}/api/contracts/${encodeURIComponent(contractNumber)}/ledger.xlsx?${query.toString()}`;
+}
+
+// Rename a contract-list batch. An empty title resets it to the default
+// (the uploaded file's name).
+export function renameBatch(
+  batchNumber: number,
+  title: string,
+): Promise<{ batchNumber: number; title: string; customTitle: string | null }> {
+  return request(`/api/contracts/batches/${batchNumber}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
 }
 
 export function uploadCustomerLedger(contractNumber: string, file: File): Promise<{ ok: boolean; paymentRecordsImported: number }> {
@@ -169,6 +248,18 @@ export function ledgerDownloadUrl(contractNumber: string): string {
 export function allLedgersDownloadUrl(batchNumber?: number): string {
   const query = batchNumber !== undefined ? `?batchNumber=${batchNumber}` : '';
   return `${API_URL}/api/contracts/ledgers.zip${query}`;
+}
+
+// ZIP of the payment ledgers of an explicit list of contracts.
+export function selectedLedgersDownloadUrl(contractNumbers: string[]): string {
+  return `${API_URL}/api/contracts/ledgers.zip?contractNumbers=${encodeURIComponent(contractNumbers.join(','))}`;
+}
+
+// ZIP of the ETB variant of an explicit list of contracts' payment ledgers.
+export function etbLedgersZipUrl(contractNumbers: string[], startDate: string): string {
+  const q = new URLSearchParams({ contractNumbers: contractNumbers.join(',') });
+  if (startDate) q.set('startDate', startDate);
+  return `${API_URL}/api/etb/ledgers.zip?${q.toString()}`;
 }
 
 export function ctsDownloadUrl(contractNumber: string): string {

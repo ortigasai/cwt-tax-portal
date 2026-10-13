@@ -4,8 +4,19 @@ import { prisma } from '../lib/prisma';
 import { uploadMemory, uploadPdfMemory } from '../lib/upload';
 import { parseContractList } from '../parsers/contractListParser';
 import { importCustomerLedgerBuffer } from '../services/dataImport';
-import { syncFromFolder } from '../services/folderSync';
-import { computeContractExposure, ContractWithRelations, deriveDisplayFields } from '../services/contractExposureService';
+import { retrieveDataForContracts } from '../services/contractIntake';
+import { fillCtsDataForContracts } from '../services/ctsDataSync';
+import {
+  ComputationOverride,
+  computeContractExposure,
+  ContractWithRelations,
+  deriveAnalysis,
+  deriveDisplayFields,
+  etbOverride,
+} from '../services/contractExposureService';
+import { parseIsoDate } from '../lib/isoDate';
+import { nonCurrentClearingDocs } from '../lib/clearingSeries';
+import { describeLedgerfitSession, lookupLedgerfitSession } from '../services/ledgerfitStatus';
 import { saveManualOverride, applyManualOverrideIfAny } from '../services/manualOverrides';
 import { generateLedgerExcel } from '../generators/ledgerExcelGenerator';
 import { contractFilePath, UPLOADS_DIR } from '../lib/fileStorage';
@@ -14,7 +25,7 @@ import path from 'path';
 
 export const contractsRouter = Router();
 
-const contractInclude = {
+export const contractInclude = {
   paymentRecords: { orderBy: { paymentDate: 'asc' as const } },
   collectionEvents: { orderBy: { datePaid: 'asc' as const } },
   matchedRptRecord: true,
@@ -26,7 +37,17 @@ function toNum(v: { toNumber(): number } | null | undefined): number | null {
   return v ? v.toNumber() : null;
 }
 
-function summarize(contract: ContractWithRelations) {
+// A batch's display title: whatever the user renamed it to, otherwise the
+// uploaded Excel file's name (minus its spreadsheet extension). Folder-sync
+// batches have no file, so their stored "Folder sync <date>" label is used.
+function batchDisplayTitle(b: { title: string | null; filename: string }): string {
+  const custom = b.title?.trim();
+  return custom ? custom : b.filename.replace(/\.(xlsx|xlsm|xls|csv)$/i, '');
+}
+
+const MAX_BATCH_TITLE_LENGTH = 120;
+
+function summarize(contract: ContractWithRelations, batchTitles?: Map<number, string>) {
   const exposure = computeContractExposure(contract);
   const display = deriveDisplayFields(contract);
   return {
@@ -40,11 +61,23 @@ function summarize(contract: ContractWithRelations) {
     cwtTaxDue: exposure.cwtTaxDue,
     actualRemitted: exposure.actualRemitted,
     variance: exposure.variance,
-    totalPenalties: exposure.penalties?.totalPenalties ?? 0,
+    totalPenalties: exposure.penalties?.totalPenalties ?? exposure.rowPenaltiesTotal,
     status: exposure.status,
     batchNumber: contract.batchNumber,
+    batchTitle: contract.batchNumber != null ? (batchTitles?.get(contract.batchNumber) ?? null) : null,
     batchDate: contract.batchDate,
+    // How many payment rows still carry a clearing document outside the 14
+    // series — non-zero means the ledger on file is not the latest one.
+    nonCurrentClearingDocs: ledgerSeriesOf(contract).length,
+    // Is the analysis done, so the payment ledger can be downloaded?
+    analysis: deriveAnalysis(contract),
   };
+}
+
+function ledgerSeriesOf(contract: ContractWithRelations): string[] {
+  return nonCurrentClearingDocs(
+    contract.paymentRecords.filter((p) => !p.isSubtotal).map((p) => p.clearingDocument),
+  );
 }
 
 function ledgerFileName(contractNumber: string): string {
@@ -53,9 +86,12 @@ function ledgerFileName(contractNumber: string): string {
 
 // Build the 2-sheet Tax Payment Ledger workbook buffer for one contract.
 // Shared by the single-contract download and the bulk ZIP download.
-async function buildLedgerBuffer(contract: ContractWithRelations): Promise<Buffer> {
-  const exposure = computeContractExposure(contract);
-  const display = deriveDisplayFields(contract);
+export async function buildLedgerBuffer(
+  contract: ContractWithRelations,
+  override?: ComputationOverride,
+): Promise<Buffer> {
+  const exposure = computeContractExposure(contract, new Date(), override);
+  const display = deriveDisplayFields(contract, override);
 
   return generateLedgerExcel({
     contractNumber: contract.contractNumber,
@@ -89,6 +125,18 @@ async function buildLedgerBuffer(contract: ContractWithRelations): Promise<Buffe
     exposure,
   });
 }
+
+// POST /api/contracts/retrieve-cts-data — fill CTS notary date / SQM / zonal
+// value from the DOAS batches for contracts that are still missing them.
+// Body: { contractNumbers?: string[] } (default: every contract missing data).
+// Empty fields only; manually entered values are never overwritten.
+contractsRouter.post('/retrieve-cts-data', async (req, res) => {
+  const body = (req.body ?? {}) as { contractNumbers?: unknown };
+  const contractNumbers = Array.isArray(body.contractNumbers)
+    ? body.contractNumbers.map((n) => String(n)).filter(Boolean)
+    : undefined;
+  res.json(await fillCtsDataForContracts(contractNumbers));
+});
 
 // POST /api/contracts/upload-list — bulk-create contract stubs from an
 // uploaded Excel file of contract numbers.
@@ -127,13 +175,26 @@ contractsRouter.post('/upload-list', uploadMemory.single('file'), async (req, re
     data: { type: 'CONTRACT_LIST', filename: req.file.originalname, rowCount: contractNumbers.length, batchNumber },
   });
 
-  // No background sync loop runs anymore (see folderSync.ts) — pull each
-  // newly-listed contract's ledger/CTS/1606 data from DATA_SYNC_DIR right
-  // now, in the same request, rather than requiring a separate manual
-  // "Sync from folder now" click afterward.
-  const syncSummary = await syncFromFolder({ force: false });
+  // Retrieve the data for exactly the uploaded contracts (ledger, 1606,
+  // CTS) in this same request — no folder-wide sync — then read them back
+  // with their computed exposure so the result comes back in one go.
+  const intake = await retrieveDataForContracts(contractNumbers);
+  const loaded = await prisma.contract.findMany({
+    where: { contractNumber: { in: contractNumbers } },
+    include: contractInclude,
+    orderBy: { contractNumber: 'asc' },
+  });
+  const batchTitles = await loadBatchTitles();
 
-  res.json({ totalFound: contractNumbers.length, created, alreadyExisted: existing, batchNumber, syncSummary });
+  res.json({
+    totalFound: contractNumbers.length,
+    created,
+    alreadyExisted: existing,
+    batchNumber,
+    batchTitle: batchDisplayTitle({ title: null, filename: req.file.originalname }),
+    intake,
+    results: loaded.map((c) => summarize(c, batchTitles)),
+  });
 });
 
 // POST /api/contracts/delete — delete the given contracts from the system.
@@ -163,20 +224,86 @@ contractsRouter.post('/delete', async (req, res) => {
 // GET /api/contracts — summary dashboard rows.
 contractsRouter.get('/', async (_req, res) => {
   const contracts = await prisma.contract.findMany({ include: contractInclude, orderBy: { createdAt: 'asc' } });
-  res.json(contracts.map((c) => summarize(c)));
+  const batchTitles = await loadBatchTitles();
+  res.json(contracts.map((c) => summarize(c, batchTitles)));
 });
 
-// GET /api/contracts/ledgers.zip[?batchNumber=N] — bundle every contract's
-// Tax Payment Ledger into a single ZIP, optionally filtered to one upload
-// batch. Registered before /:contractNumber so "ledgers.zip" isn't matched
-// as a contract number.
+async function loadBatchTitles(): Promise<Map<number, string>> {
+  const batches = await prisma.importBatch.findMany({
+    where: { type: 'CONTRACT_LIST', batchNumber: { not: null } },
+    orderBy: { importedAt: 'asc' },
+  });
+  const map = new Map<number, string>();
+  for (const b of batches) {
+    if (b.batchNumber != null && !map.has(b.batchNumber)) map.set(b.batchNumber, batchDisplayTitle(b));
+  }
+  return map;
+}
+
+// GET /api/contracts/batches — every contract-list upload (and folder-sync
+// run) as a numbered batch, with its display title. Registered before
+// /:contractNumber so "batches" isn't matched as a contract number.
+contractsRouter.get('/batches', async (_req, res) => {
+  const batches = await prisma.importBatch.findMany({
+    where: { type: 'CONTRACT_LIST', batchNumber: { not: null } },
+    orderBy: [{ batchNumber: 'asc' }, { importedAt: 'asc' }],
+  });
+  res.json(
+    batches.map((b) => ({
+      batchNumber: b.batchNumber,
+      title: batchDisplayTitle(b),
+      customTitle: b.title,
+      filename: b.filename,
+      rowCount: b.rowCount,
+      importedAt: b.importedAt,
+    })),
+  );
+});
+
+// PATCH /api/contracts/batches/:batchNumber — rename a batch.
+// Body: { title: string }. An empty/blank title resets it to the default
+// (the uploaded file's name).
+contractsRouter.patch('/batches/:batchNumber', async (req, res) => {
+  const batchNumber = Number(req.params.batchNumber);
+  if (!Number.isInteger(batchNumber)) return res.status(400).json({ error: 'Invalid batch number' });
+
+  const raw = (req.body as { title?: unknown }).title;
+  if (typeof raw !== 'string') return res.status(400).json({ error: 'title must be a string' });
+  const title = raw.trim().replace(/\s+/g, ' ');
+  if (title.length > MAX_BATCH_TITLE_LENGTH) {
+    return res.status(400).json({ error: `Title is too long (max ${MAX_BATCH_TITLE_LENGTH} characters)` });
+  }
+
+  const result = await prisma.importBatch.updateMany({
+    where: { type: 'CONTRACT_LIST', batchNumber },
+    data: { title: title || null },
+  });
+  if (result.count === 0) return res.status(404).json({ error: `Batch ${batchNumber} not found` });
+
+  const updated = await prisma.importBatch.findFirst({ where: { type: 'CONTRACT_LIST', batchNumber } });
+  res.json({
+    batchNumber,
+    title: updated ? batchDisplayTitle(updated) : title,
+    customTitle: updated?.title ?? null,
+  });
+});
+
+// GET /api/contracts/ledgers.zip[?batchNumber=N | ?contractNumbers=a,b,c] —
+// bundle every contract's Tax Payment Ledger into a single ZIP, optionally
+// filtered to one upload batch or to an explicit list of contracts.
+// Registered before /:contractNumber so "ledgers.zip" isn't matched as a
+// contract number.
 contractsRouter.get('/ledgers.zip', async (req, res) => {
   const raw = req.query.batchNumber;
   const batchNumber = raw !== undefined ? Number(raw) : undefined;
   const filterByBatch = batchNumber !== undefined && !Number.isNaN(batchNumber);
+  const listed =
+    typeof req.query.contractNumbers === 'string'
+      ? [...new Set(req.query.contractNumbers.split(',').map((n) => n.trim()).filter(Boolean))]
+      : null;
 
   const contracts = await prisma.contract.findMany({
-    where: filterByBatch ? { batchNumber } : {},
+    where: listed ? { contractNumber: { in: listed } } : filterByBatch ? { batchNumber } : {},
     include: contractInclude,
     orderBy: { contractNumber: 'asc' },
   });
@@ -196,9 +323,23 @@ contractsRouter.get('/ledgers.zip', async (req, res) => {
   const content = await zip.generateAsync({ type: 'nodebuffer' });
 
   const stamp = new Date().toISOString().slice(0, 10);
-  const name = filterByBatch
-    ? `TaxPaymentLedgers_Batch${batchNumber}_${stamp}.zip`
-    : `TaxPaymentLedgers_All_${stamp}.zip`;
+  let titlePart = '';
+  if (filterByBatch) {
+    const batch = await prisma.importBatch.findFirst({ where: { type: 'CONTRACT_LIST', batchNumber } });
+    // Header-safe: letters, digits, dot, underscore, hyphen only.
+    const safe = batch
+      ? batchDisplayTitle(batch)
+          .replace(/[^A-Za-z0-9._-]+/g, '_')
+          .replace(/^_+|_+$/g, '')
+          .slice(0, 50)
+      : '';
+    if (safe) titlePart = `_${safe}`;
+  }
+  const name = listed
+    ? `TaxPaymentLedgers_Selected${listed.length}_${stamp}.zip`
+    : filterByBatch
+      ? `TaxPaymentLedgers_Batch${batchNumber}${titlePart}_${stamp}.zip`
+      : `TaxPaymentLedgers_All_${stamp}.zip`;
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
   res.send(content);
@@ -215,7 +356,25 @@ contractsRouter.get('/:contractNumber', async (req, res) => {
   const exposure = computeContractExposure(contract);
   const display = deriveDisplayFields(contract);
 
+  // Is the ledger on file LedgerFit's latest one? Any clearing document
+  // outside the 14 series says it isn't; then look up the LedgerFit session
+  // so the page can say what to do (best effort).
+  const staleDocs = ledgerSeriesOf(contract);
+  const ledgerSeries = {
+    isLatest: staleDocs.length === 0,
+    nonCurrentCount: staleDocs.length,
+    sample: staleDocs.slice(0, 5),
+    advice: null as string | null,
+    ledgerfitSessionId: null as string | null,
+  };
+  if (staleDocs.length > 0) {
+    const session = await lookupLedgerfitSession(contract.contractNumber);
+    ledgerSeries.advice = describeLedgerfitSession(session);
+    ledgerSeries.ledgerfitSessionId = session?.sessionId ?? null;
+  }
+
   res.json({
+    ledgerSeries,
     contractNumber: contract.contractNumber,
     buyerName: contract.buyerName,
     estate: contract.estate,
@@ -400,9 +559,15 @@ contractsRouter.get('/:contractNumber/ledger.xlsx', async (req, res) => {
   });
   if (!contract) return res.status(404).json({ error: 'Contract not found' });
 
-  const buffer = await buildLedgerBuffer(contract);
+  // ?etb=1[&etbStart=YYYY-MM-DD] — the ETB Calculator's variant: same export,
+  // with the buyer treated as ETB from the given start date.
+  const asEtb = req.query.etb === '1';
+  const etbStart = parseIsoDate(req.query.etbStart);
+  const override: ComputationOverride | undefined = asEtb ? etbOverride(etbStart) : undefined;
+  const buffer = await buildLedgerBuffer(contract, override);
+  const fileName = asEtb ? `ETB_${ledgerFileName(contract.contractNumber)}` : ledgerFileName(contract.contractNumber);
 
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', `attachment; filename="${ledgerFileName(contract.contractNumber)}"`);
+  res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
   res.send(buffer);
 });

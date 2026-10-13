@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { fetchRdoLocations, fetchZonalValueRegions, uploadOclp1606, uploadRptTowers } from '../api/client';
+import FileDropzone from '../components/FileDropzone';
 
 function useUpload<T>(fn: (file: File) => Promise<T>) {
   const [busy, setBusy] = useState(false);
@@ -42,28 +43,37 @@ export default function ReferenceDataPage() {
 
   return (
     <div>
+      <div className="page-header">
+        <div>
+          <h1>Reference data</h1>
+          <p className="page-subtitle">
+            Shared lookup files the computations rely on. Most of the time the SharePoint update on the Dashboard keeps
+            these current — upload here only to replace one by hand.
+          </p>
+        </div>
+      </div>
+
       <div className="card">
-        <h2>OCLP 1606 Summary</h2>
-        <p className="muted">
+        <h3 className="card-title">OCLP 1606 Summary</h3>
+        <p className="card-subtitle" style={{ marginBottom: 14 }}>
           Bulk-uploads the FINAL tab: buyer classification, tax tagging, transaction/paid dates, and actual CWT
           remitted per collection. This can take up to a minute for large files (70k+ rows). Re-uploading replaces
           collection events for any contract touched by the file.
         </p>
-        <div className="upload-box">
-          <input
-            type="file"
-            accept=".xlsx,.xls"
-            disabled={oclp.busy}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) oclp.run(file);
-            }}
-          />
-        </div>
-        {oclp.busy && <p className="muted">Parsing and importing — this may take a minute…</p>}
-        {oclp.error && <div className="callout callout-error">{oclp.error}</div>}
+        <FileDropzone
+          accept=".xlsx,.xls"
+          disabled={oclp.busy}
+          title={oclp.busy ? 'Parsing and importing — this may take a minute…' : 'Drop the OCLP 1606 Summary here'}
+          hint=".xlsx or .xls"
+          onFile={oclp.run}
+        />
+        {oclp.error && (
+          <div className="callout callout-error" style={{ marginBottom: 0 }}>
+            {oclp.error}
+          </div>
+        )}
         {oclp.result && (
-          <div className="callout" style={{ background: '#dcfce7', color: '#166534' }}>
+          <div className="callout callout-success" style={{ marginBottom: 0 }}>
             Parsed {oclp.result.totalRows} rows — matched {oclp.result.matchedRows} to {oclp.result.contractsUpdated}{' '}
             existing contract(s); {oclp.result.unmatchedRows} rows had no matching contract on file (expected if the
             summary covers contracts you haven't uploaded yet).
@@ -72,33 +82,32 @@ export default function ReferenceDataPage() {
       </div>
 
       <div className="card">
-        <h2>RPT_ALL TOWERS.xlsx</h2>
-        <p className="muted">
+        <h3 className="card-title">RPT_ALL TOWERS.xlsx</h3>
+        <p className="card-subtitle" style={{ marginBottom: 14 }}>
           Replaces the Fair Market Value reference table wholesale (the "ALL" sheet: Tower, Unit, Fair Market Value).
           Use the contract detail page to search and match a contract to its FMV record.
         </p>
-        <div className="upload-box">
-          <input
-            type="file"
-            accept=".xlsx,.xls"
-            disabled={rpt.busy}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) rpt.run(file);
-            }}
-          />
-        </div>
-        {rpt.busy && <p className="muted">Uploading…</p>}
-        {rpt.error && <div className="callout callout-error">{rpt.error}</div>}
+        <FileDropzone
+          accept=".xlsx,.xls"
+          disabled={rpt.busy}
+          title={rpt.busy ? 'Uploading…' : 'Drop RPT_ALL TOWERS.xlsx here'}
+          hint=".xlsx or .xls"
+          onFile={rpt.run}
+        />
+        {rpt.error && (
+          <div className="callout callout-error" style={{ marginBottom: 0 }}>
+            {rpt.error}
+          </div>
+        )}
         {rpt.result && (
-          <div className="callout" style={{ background: '#dcfce7', color: '#166534' }}>
+          <div className="callout callout-success" style={{ marginBottom: 0 }}>
             Imported {rpt.result.rowsImported} FMV records.
           </div>
         )}
       </div>
 
       <div className="card">
-        <h2>Zonal Value Locations — Tower to RDO Mapping</h2>
+        <h3 className="card-title">Zonal Value Locations — Tower to RDO Mapping</h3>
         <p className="muted">
           Use this to identify which Revenue District Office's zonal value schedule applies to a contract's tower,
           then check that RDO's schedule on{' '}
@@ -129,7 +138,7 @@ export default function ReferenceDataPage() {
       </div>
 
       <div className="card">
-        <h2>BIR Zonal Values — Revenue Regions</h2>
+        <h3 className="card-title">BIR Zonal Values — Revenue Regions</h3>
         <p className="muted">
           BIR's zonal value schedules have no public API, are organized as PDFs per revenue district office, and — as
           of this build — every region on the live site still shows unpublished placeholder content. Zonal value must

@@ -13,6 +13,7 @@ import {
 import type { ContractDetail, RptTowerRecord, ZonalLookupResult } from '../api/types';
 import { formatCurrency, formatDate } from '../utils/format';
 import StatusBadge from '../components/StatusBadge';
+import Icon from '../components/Icon';
 
 export default function ContractDetailPage() {
   const { contractNumber } = useParams<{ contractNumber: string }>();
@@ -30,18 +31,23 @@ export default function ContractDetailPage() {
   useEffect(reload, [contractNumber]);
 
   if (error) return <div className="callout callout-error">{error}</div>;
-  if (!contract) return <p className="muted">Loading…</p>;
+  if (!contract)
+    return (
+      <div className="loading">
+        <span className="spinner" /> Loading contract…
+      </div>
+    );
 
   const e = contract.exposure;
 
   return (
     <div>
-      <p>
-        <Link to="/">&larr; Back to dashboard</Link>
-      </p>
+      <Link className="back-link" to="/">
+        <Icon name="arrowLeft" /> Back to dashboard
+      </Link>
 
       <div className="card">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+        <div className="contract-header">
           <div>
             <h2>
               Contract {contract.contractNumber} <StatusBadge status={e.status} />
@@ -52,7 +58,7 @@ export default function ContractDetailPage() {
             </p>
           </div>
           <a className="btn" href={ledgerDownloadUrl(contract.contractNumber)}>
-            Download Tax Payment Ledger (.xlsx)
+            <Icon name="download" /> Download Tax Payment Ledger (.xlsx)
           </a>
         </div>
 
@@ -69,7 +75,7 @@ export default function ContractDetailPage() {
             <div className="label">Actual Remitted</div>
             <div className="value">{formatCurrency(e.actualRemitted)}</div>
           </div>
-          <div className="stat-box">
+          <div className={`stat-box ${e.variance != null && e.variance > 0 ? 'stat-danger' : 'stat-success'}`}>
             <div className="label">Variance / Exposure</div>
             <div className="value">{formatCurrency(e.variance)}</div>
           </div>
@@ -128,7 +134,18 @@ export default function ContractDetailPage() {
         )}
       </div>
 
-      {notice && <div className="callout" style={{ background: '#dcfce7', color: '#166534' }}>{notice}</div>}
+      {notice && <div className="callout callout-success">{notice}</div>}
+
+      {contract.ledgerSeries && !contract.ledgerSeries.isLatest && (
+        <div className="callout callout-error">
+          <strong>This is not the latest payment ledger.</strong> {contract.ledgerSeries.nonCurrentCount} payment
+          row(s) have a clearing document outside the 14 series (
+          {contract.ledgerSeries.sample.join(', ')}
+          {contract.ledgerSeries.nonCurrentCount > contract.ledgerSeries.sample.length ? ', …' : ''}). The CWT figures
+          below are computed from it, so treat them as provisional.
+          {contract.ledgerSeries.advice && <div>{contract.ledgerSeries.advice}</div>}
+        </div>
+      )}
 
       <SourceDataCard contract={contract} onChange={reload} onNotice={setNotice} />
       <ManualEntryCard contract={contract} onChange={reload} onNotice={setNotice} />
@@ -684,13 +701,29 @@ function PerPaymentExposureCard({ contract }: { contract: ContractDetail }) {
               <td>{formatCurrency(line.totalCollection)}</td>
               <td>{formatCurrency(line.paymentPrincipal)}</td>
               <td>{formatCurrency(line.paymentVat)}</td>
-              <td>{line.applicableDeadline ? formatDate(line.applicableDeadline) : '—'}</td>
+              <td>
+                {line.coveredByBulkRemittance ? (
+                  <span className="hint">Covered by AR Sale bulk remittance</span>
+                ) : line.applicableDeadline ? (
+                  formatDate(line.applicableDeadline)
+                ) : (
+                  '—'
+                )}
+              </td>
               <td>{line.shouldBeCwtDue !== null ? formatCurrency(line.shouldBeCwtDue) : '—'}</td>
               <td>{formatDateList(line.cwtFileTransactionDates)}</td>
               <td>{formatDateList(line.cwtFileDatesPaid)}</td>
               <td>{line.cwtFileTaxBase !== null ? formatCurrency(line.cwtFileTaxBase) : '—'}</td>
               <td>{line.cwtFileTaxDue !== null ? formatCurrency(line.cwtFileTaxDue) : '—'}</td>
-              <td>{line.remittedInDeadlineMonth === null ? '—' : line.remittedInDeadlineMonth ? 'Yes' : 'No'}</td>
+              <td>
+                {line.paidInAdvance
+                  ? 'Paid in advance'
+                  : line.remittedInDeadlineMonth === null
+                    ? '—'
+                    : line.remittedInDeadlineMonth
+                      ? 'Yes'
+                      : 'No'}
+              </td>
               <td>{line.difference !== null ? formatCurrency(line.difference) : '—'}</td>
               <td>{line.penalties ? formatCurrency(line.penalties.surcharge) : '—'}</td>
               <td>{line.penalties ? formatCurrency(line.penalties.compromisePenalty) : '—'}</td>

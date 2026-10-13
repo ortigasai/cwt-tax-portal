@@ -127,8 +127,6 @@ describe('computeDeadline', () => {
       buyerClassification: 'ETB',
       taxTagging: 'INSTALLMENT',
       paymentRecords: [
-        // Not round-thousands, so this isn't treated as a reservation fee —
-        // see the dedicated reservation-fee tests below for that case.
         { paymentDate: new Date('2023-01-15'), totalCollection: 123456, isSubtotal: false },
         { paymentDate: new Date('2023-02-15'), totalCollection: 200001, isSubtotal: false },
       ],
@@ -140,39 +138,410 @@ describe('computeDeadline', () => {
     expect(result.primaryDeadline?.toISOString().slice(0, 10)).toBe('2023-02-10');
   });
 
-  it('ETB + Installment: folds a round-thousands reservation fee into the 1st downpayment, net of VAT', () => {
-    // Exact figures from real contract 2000000007819: reservation fee
-    // 25,000 has no reliable principal/VAT breakdown in the source ledger
-    // (booked as principal=25,000, VAT=0), so its net-of-VAT value is
-    // derived via /1.12. The 1st downpayment's own recorded principal
-    // (4,531.25) is trusted as-is — its VAT split doesn't follow a clean
-    // 12% ratio in the real data, so it must NOT be re-derived from its
-    // gross total (that would give the wrong answer).
+  it('ETB start date: only payments on/after it carry a per-collection obligation', () => {
+    const records = [
+      { paymentDate: new Date('2023-01-15'), totalCollection: 123456, isSubtotal: false },
+      { paymentDate: new Date('2023-02-15'), totalCollection: 200001, isSubtotal: false },
+      { paymentDate: new Date('2023-03-15'), totalCollection: 112000, isSubtotal: false },
+    ];
+    const withStart = baseInput({
+      buyerClassification: 'ETB',
+      taxTagging: 'INSTALLMENT',
+      etbStartDate: new Date('2023-02-15'), // inclusive
+      paymentRecords: records,
+    });
+    const result = computeDeadline(withStart);
+    expect(result.entries.map((e) => e.date.toISOString().slice(0, 10))).toEqual(['2023-03-10', '2023-04-10']);
+    expect(result.primaryDeadline?.toISOString().slice(0, 10)).toBe('2023-03-10');
+    expect(result.note).toContain('ETB start date (02/15/2023)');
+
+    // The per-payment table lines up: the pre-start row has no obligation of its own.
+    const exposure = computeExposure(withStart, new Date('2023-06-01'));
+    const lines = exposure.perPaymentLines.filter((l) => l.paymentDate);
+    expect(lines.map((l) => l.shouldBeCwtDue)).toEqual([null, 8928.62, 5000]);
+
+    // Without a start date every payment is scheduled, as before.
+    const noStart = computeDeadline({ ...withStart, etbStartDate: null });
+    expect(noStart.entries).toHaveLength(3);
+  });
+
+  it('AR Sale remark: payments after the bulk CWT remittance carry no CWT due, deadline or penalty', () => {
+    // Real shape of contract 2000000004977: Individual + Installment whose
+    // whole CWT was remitted in one 1606 row (remarks "AR SALE") in 2020,
+    // while amortization kept running until 2025.
+    const input = baseInput({
+      buyerClassification: 'INDIVIDUAL',
+      taxTagging: 'INSTALLMENT',
+      netTCP: 1_000_000,
+      fmvPerTaxDeclarationUnit: null,
+      zonalValuePerSqmUnit: null,
+      zonalValuePerSqmParking: null,
+      paymentRecords: [
+        { paymentDate: new Date('2020-08-27'), totalCollection: 560000, isSubtotal: false },
+        { paymentDate: new Date('2022-03-15'), totalCollection: 224000, isSubtotal: false },
+        { paymentDate: new Date('2025-09-17'), totalCollection: 224000, isSubtotal: false },
+      ],
+      collectionEvents: [
+        {
+          actualTaxDue: 50_000,
+          datePaid: new Date('2020-09-10'),
+          transactionDate: new Date('2020-08-30'),
+          sourceTaxBase: 1_000_000,
+          remarks: 'AR SALE',
+        },
+      ],
+    });
+    const exposure = computeExposure(input, new Date('2026-10-12'));
+    expect(exposure.status).toBe('COMPLIANT');
+    expect(exposure.penalties).toBeNull();
+    const dated = exposure.perPaymentLines.filter((l) => l.paymentDate);
+    // The trigger row (last payment, 2025) is after the bulk remittance: nothing due, no penalty.
+    const last = dated[dated.length - 1];
+    expect(last.coveredByBulkRemittance).toBe(true);
+    expect(last.shouldBeCwtDue).toBeNull();
+    expect(last.applicableDeadline).toBeNull();
+    expect(last.penalties).toBeNull();
+    expect(last.totalDue).toBeNull();
+    expect(dated.every((l) => l.penalties === null)).toBe(true);
+    expect(exposure.deadline.note).toContain('AR Sale');
+  });
+
+  describe('interest stops on the date the CWT was actually paid', () => {
+    const days = (a: string, b: string) =>
+      Math.floor((new Date(b).getTime() - new Date(a).getTime()) / (24 * 60 * 60 * 1000));
+    const etb = (events: ContractComputationInput['collectionEvents']) =>
+      baseInput({
+        buyerClassification: 'ETB',
+        taxTagging: 'INSTALLMENT',
+        netTCP: 100_000,
+        fmvPerTaxDeclarationUnit: null,
+        zonalValuePerSqmUnit: null,
+        zonalValuePerSqmParking: null,
+        paymentRecords: [
+          { paymentDate: new Date('2021-01-15'), totalCollection: 112000, isSubtotal: false, paymentPrincipal: 100000 },
+        ],
+        collectionEvents: events,
+      });
+
+    it('a late remittance: interest runs from the deadline to the paid date, not to today', () => {
+      const exposure = computeExposure(
+        etb([{ actualTaxDue: 5_000, datePaid: new Date('2024-03-10'), transactionDate: new Date('2024-03-01'), sourceTaxBase: 100_000 }]),
+        new Date('2026-10-12'),
+      );
+      const row = exposure.perPaymentLines.filter((l) => l.paymentDate)[0];
+      const lateDays = days('2021-02-10', '2024-03-10'); // deadline 02/10/2021 -> paid 03/10/2024
+      expect(row.penalties?.daysLate).toBe(lateDays);
+      expect(row.penalties?.interest).toBe(round2(5_000 * 0.12 * (lateDays / 365)));
+      expect(row.penalties?.surcharge).toBe(1_250);
+      expect(row.penalties?.compromisePenalty).toBe(1_000);
+      // Nothing is outstanding any more.
+      expect(row.difference).toBe(0);
+      expect(row.totalDue).toBe(row.penalties!.totalPenalties);
+      expect(exposure.status).toBe('NON_COMPLIANT');
+    });
+
+    it('part paid late, part still unpaid: the paid part stops at its paid date, the rest runs to today', () => {
+      const asOf = '2026-10-12';
+      const exposure = computeExposure(
+        etb([{ actualTaxDue: 3_000, datePaid: new Date('2022-02-10'), transactionDate: new Date('2022-01-31'), sourceTaxBase: 60_000 }]),
+        new Date(asOf),
+      );
+      const row = exposure.perPaymentLines.filter((l) => l.paymentDate)[0];
+      const paidDays = days('2021-02-10', '2022-02-10');
+      const openDays = days('2021-02-10', asOf);
+      expect(row.difference).toBe(2_000); // still unpaid
+      expect(row.penalties?.interest).toBe(round2(3_000 * 0.12 * (paidDays / 365) + 2_000 * 0.12 * (openDays / 365)));
+      expect(row.penalties?.surcharge).toBe(1_250); // 25% of the whole 5,000 that was late or unpaid
+      expect(row.penalties?.daysLate).toBe(openDays);
+    });
+
+    it('paid on the deadline, or the next working day when it falls on a weekend: no penalty', () => {
+      // Deadline 02/10/2021 is a Wednesday — paid that day.
+      const onDay = computeExposure(
+        etb([{ actualTaxDue: 5_000, datePaid: new Date('2021-02-10'), transactionDate: new Date('2021-01-31'), sourceTaxBase: 100_000 }]),
+        new Date('2026-10-12'),
+      );
+      expect(onDay.perPaymentLines.filter((l) => l.paymentDate)[0].penalties).toBeNull();
+      expect(onDay.status).toBe('COMPLIANT');
+
+      // Deadline 10/10/2021 is a Sunday — paying Monday 10/11 is on time.
+      const weekend = baseInput({
+        buyerClassification: 'ETB',
+        taxTagging: 'INSTALLMENT',
+        netTCP: 100_000,
+        fmvPerTaxDeclarationUnit: null,
+        zonalValuePerSqmUnit: null,
+        zonalValuePerSqmParking: null,
+        paymentRecords: [
+          { paymentDate: new Date('2021-09-08'), totalCollection: 112000, isSubtotal: false, paymentPrincipal: 100000 },
+        ],
+        collectionEvents: [
+          { actualTaxDue: 5_000, datePaid: new Date('2021-10-11'), transactionDate: new Date('2021-09-30'), sourceTaxBase: 100_000 },
+        ],
+      });
+      expect(computeExposure(weekend, new Date('2026-10-12')).status).toBe('COMPLIANT');
+    });
+  });
+
+  it('Not compliant: totals tie out but a late payment carries a computed penalty', () => {
+    const input = baseInput({
+      buyerClassification: 'ETB',
+      taxTagging: 'INSTALLMENT',
+      netTCP: 100_000,
+      fmvPerTaxDeclarationUnit: null,
+      zonalValuePerSqmUnit: null,
+      zonalValuePerSqmParking: null,
+      paymentRecords: [
+        { paymentDate: new Date('2021-01-15'), totalCollection: 112000, isSubtotal: false, paymentPrincipal: 100000 },
+      ],
+      // The full CWT was remitted, but three years after its 02/10/2021 deadline.
+      collectionEvents: [
+        { actualTaxDue: 5_000, datePaid: new Date('2024-03-10'), transactionDate: new Date('2024-03-01'), sourceTaxBase: 100_000 },
+      ],
+    });
+    const exposure = computeExposure(input, new Date('2026-10-12'));
+    expect(exposure.variance).toBe(0);
+    expect(exposure.penalties).toBeNull(); // no contract-level penalty…
+    expect(exposure.rowPenaltiesTotal).toBeGreaterThan(0); // …but the row's penalty was computed
+    expect(exposure.status).toBe('NON_COMPLIANT');
+  });
+
+  it('Compliant stays compliant when nothing was late (no computed penalty anywhere)', () => {
+    const input = baseInput({
+      buyerClassification: 'ETB',
+      taxTagging: 'INSTALLMENT',
+      netTCP: 100_000,
+      fmvPerTaxDeclarationUnit: null,
+      zonalValuePerSqmUnit: null,
+      zonalValuePerSqmParking: null,
+      paymentRecords: [
+        { paymentDate: new Date('2021-01-15'), totalCollection: 112000, isSubtotal: false, paymentPrincipal: 100000 },
+      ],
+      collectionEvents: [
+        { actualTaxDue: 5_000, datePaid: new Date('2021-02-08'), transactionDate: new Date('2021-01-31'), sourceTaxBase: 100_000 },
+      ],
+    });
+    const exposure = computeExposure(input, new Date('2026-10-12'));
+    expect(exposure.rowPenaltiesTotal).toBe(0);
+    expect(exposure.status).toBe('COMPLIANT');
+  });
+
+  it('CWT paid in full in advance (no AR Sale remark): later payments carry no shortfall or penalty', () => {
+    // Shape of contract 2000000008098: ETB + Installment, the whole CWT filed
+    // across three early 1606 rows, payments continuing for years after.
+    const input = baseInput({
+      buyerClassification: 'ETB',
+      taxTagging: 'INSTALLMENT',
+      netTCP: 1_000_000,
+      fmvPerTaxDeclarationUnit: null,
+      zonalValuePerSqmUnit: null,
+      zonalValuePerSqmParking: null,
+      paymentRecords: [
+        { paymentDate: new Date('2021-09-08'), totalCollection: 560000, isSubtotal: false, paymentPrincipal: 500000 },
+        { paymentDate: new Date('2022-03-22'), totalCollection: 112000, isSubtotal: false, paymentPrincipal: 100000 },
+        { paymentDate: new Date('2024-06-24'), totalCollection: 112000, isSubtotal: false, paymentPrincipal: 100000 },
+        { paymentDate: new Date('2025-08-07'), totalCollection: 336000, isSubtotal: false, paymentPrincipal: 300000 },
+      ],
+      collectionEvents: [
+        { actualTaxDue: 25_000, datePaid: new Date('2021-10-11'), transactionDate: new Date('2021-09-30'), sourceTaxBase: 500_000 },
+        { actualTaxDue: 25_000, datePaid: new Date('2022-02-10'), transactionDate: new Date('2022-01-31'), sourceTaxBase: 500_000 },
+      ],
+    });
+    const exposure = computeExposure(input, new Date('2026-10-12'));
+    expect(exposure.cwtTaxDue).toBe(50_000);
+    expect(exposure.actualRemitted).toBe(50_000);
+    expect(exposure.status).toBe('COMPLIANT');
+    const dated = exposure.perPaymentLines.filter((l) => l.paymentDate);
+    // First row is met by its own month's remittance; the three later rows would
+    // each be "short" month-by-month but are covered by the advance remittance.
+    expect(dated.map((l) => l.paidInAdvance)).toEqual([false, true, true, true]);
+    for (const l of dated.slice(1)) {
+      expect(l.difference).toBe(0);
+      expect(l.penalties).toBeNull();
+      expect(l.totalDue).toBeNull();
+      expect(l.shouldBeCwtDue).not.toBeNull(); // the amount stays visible
+    }
+    expect(exposure.deadline.note).toContain('remitted in advance already covered 3 payment(s)');
+  });
+
+  it('CWT only partly remitted ahead: a payment is still penalised once the advance no longer covers it', () => {
+    const input = baseInput({
+      buyerClassification: 'ETB',
+      taxTagging: 'INSTALLMENT',
+      netTCP: 1_000_000,
+      fmvPerTaxDeclarationUnit: null,
+      zonalValuePerSqmUnit: null,
+      zonalValuePerSqmParking: null,
+      paymentRecords: [
+        { paymentDate: new Date('2021-09-08'), totalCollection: 560000, isSubtotal: false, paymentPrincipal: 500000 },
+        { paymentDate: new Date('2024-06-24'), totalCollection: 560000, isSubtotal: false, paymentPrincipal: 500000 },
+      ],
+      collectionEvents: [
+        { actualTaxDue: 25_000, datePaid: new Date('2021-10-11'), transactionDate: new Date('2021-09-30'), sourceTaxBase: 500_000 },
+      ],
+    });
+    const exposure = computeExposure(input, new Date('2026-10-12'));
+    const dated = exposure.perPaymentLines.filter((l) => l.paymentDate);
+    expect(dated[1].paidInAdvance).toBe(false);
+    expect(dated[1].difference).toBe(25_000);
+    expect(dated[1].penalties).not.toBeNull();
+    expect(exposure.status).toBe('UNDER_REMITTED');
+  });
+
+  it('AR Sale remark, remitted in full: ties out, the bulk row shows the CWT due with a zero difference', () => {
+    const input = baseInput({
+      buyerClassification: 'INDIVIDUAL',
+      taxTagging: 'INSTALLMENT',
+      netTCP: 1_000_000,
+      fmvPerTaxDeclarationUnit: null,
+      zonalValuePerSqmUnit: null,
+      zonalValuePerSqmParking: null,
+      paymentRecords: [
+        { paymentDate: new Date('2020-08-27'), totalCollection: 560000, isSubtotal: false },
+        { paymentDate: new Date('2025-09-17'), totalCollection: 224000, isSubtotal: false },
+      ],
+      collectionEvents: [
+        { actualTaxDue: 50_000, datePaid: new Date('2020-09-10'), transactionDate: new Date('2020-08-30'), sourceTaxBase: 1_000_000, remarks: 'AR SALE' },
+      ],
+    });
+    const exposure = computeExposure(input, new Date('2026-10-12'));
+    const [bulkRow, lastRow] = exposure.perPaymentLines.filter((l) => l.paymentDate);
+    expect(bulkRow.shouldBeCwtDue).toBe(50_000);
+    expect(bulkRow.cwtFileTaxDue).toBe(50_000);
+    expect(bulkRow.difference).toBe(0);
+    expect(bulkRow.penalties).toBeNull();
+    expect(lastRow.shouldBeCwtDue).toBeNull();
+    expect(exposure.deadline.note).toContain('tied');
+  });
+
+  it('AR Sale remark but the remittance is SHORT: still flagged under-remitted, penalties from the AR Sale deadline', () => {
+    const input = baseInput({
+      buyerClassification: 'INDIVIDUAL',
+      taxTagging: 'INSTALLMENT',
+      netTCP: 1_000_000,
+      fmvPerTaxDeclarationUnit: null,
+      zonalValuePerSqmUnit: null,
+      zonalValuePerSqmParking: null,
+      paymentRecords: [
+        { paymentDate: new Date('2020-08-27'), totalCollection: 560000, isSubtotal: false },
+        { paymentDate: new Date('2025-09-17'), totalCollection: 224000, isSubtotal: false },
+      ],
+      collectionEvents: [
+        { actualTaxDue: 30_000, datePaid: new Date('2020-09-10'), transactionDate: new Date('2020-08-30'), sourceTaxBase: 600_000, remarks: 'AR SALE' },
+      ],
+    });
+    const exposure = computeExposure(input, new Date('2026-10-12'));
+    expect(exposure.status).toBe('UNDER_REMITTED');
+    expect(exposure.variance).toBe(20_000);
+    // Penalties are anchored on 10th of the month after the AR Sale (09/10/2020), not the 2025 amortization.
+    expect(exposure.deadline.primaryDeadline?.toISOString().slice(0, 10)).toBe('2020-09-10');
+    expect(exposure.penalties).not.toBeNull();
+    expect(exposure.penalties!.surcharge).toBe(5_000);
+    expect(exposure.penalties!.daysLate).toBeGreaterThan(2000);
+    expect(exposure.deadline.note).toContain('SHORT by ₱20,000.00');
+
+    // The same shortfall is visible on the bulk remittance's row; later payments stay clean.
+    const [bulkRow, lastRow] = exposure.perPaymentLines.filter((l) => l.paymentDate);
+    expect(bulkRow.shouldBeCwtDue).toBe(50_000);
+    expect(bulkRow.difference).toBe(20_000);
+    expect(bulkRow.penalties).not.toBeNull();
+    expect(lastRow.coveredByBulkRemittance).toBe(true);
+    expect(lastRow.penalties).toBeNull();
+  });
+
+  it('No AR Sale remark but remitted in full ahead: the last payment keeps its should-be CWT yet carries no penalty', () => {
+    const input = baseInput({
+      buyerClassification: 'INDIVIDUAL',
+      taxTagging: 'INSTALLMENT',
+      netTCP: 1_000_000,
+      fmvPerTaxDeclarationUnit: null,
+      zonalValuePerSqmUnit: null,
+      zonalValuePerSqmParking: null,
+      paymentRecords: [
+        { paymentDate: new Date('2020-08-27'), totalCollection: 560000, isSubtotal: false },
+        { paymentDate: new Date('2025-09-17'), totalCollection: 224000, isSubtotal: false },
+      ],
+      collectionEvents: [
+        {
+          actualTaxDue: 50_000,
+          datePaid: new Date('2020-09-10'),
+          transactionDate: new Date('2020-08-30'),
+          sourceTaxBase: 1_000_000,
+          remarks: null,
+        },
+      ],
+    });
+    const last = computeExposure(input, new Date('2026-10-12')).perPaymentLines.filter((l) => l.paymentDate).pop()!;
+    expect(last.coveredByBulkRemittance).toBe(false);
+    expect(last.shouldBeCwtDue).toBe(50_000);
+    expect(last.paidInAdvance).toBe(true);
+    expect(last.difference).toBe(0);
+    expect(last.penalties).toBeNull();
+  });
+
+  it('AR Sale remark + ETB: only payments up to the bulk remittance carry per-collection obligations', () => {
+    const result = computeDeadline(
+      baseInput({
+        buyerClassification: 'ETB',
+        taxTagging: 'INSTALLMENT',
+        paymentRecords: [
+          { paymentDate: new Date('2020-01-15'), totalCollection: 112000, isSubtotal: false },
+          { paymentDate: new Date('2020-08-27'), totalCollection: 112000, isSubtotal: false },
+          { paymentDate: new Date('2021-03-15'), totalCollection: 112000, isSubtotal: false },
+        ],
+        collectionEvents: [
+          { actualTaxDue: 50_000, datePaid: new Date('2020-09-10'), transactionDate: new Date('2020-08-30'), sourceTaxBase: 1_000_000, remarks: 'AR Sale' },
+        ],
+      }),
+    );
+    expect(result.entries.map((e) => e.date.toISOString().slice(0, 10))).toEqual(['2020-02-10', '2020-09-10']);
+  });
+
+  it('ETB start date after every payment: no deadlines are scheduled', () => {
+    const result = computeDeadline(
+      baseInput({
+        buyerClassification: 'ETB',
+        taxTagging: 'INSTALLMENT',
+        etbStartDate: new Date('2030-01-01'),
+        paymentRecords: [{ paymentDate: new Date('2023-01-15'), totalCollection: 123456, isSubtotal: false }],
+      }),
+    );
+    expect(result.entries).toHaveLength(0);
+    expect(result.primaryDeadline).toBeNull();
+    expect(result.note).toContain('No payment on or after the ETB start date');
+  });
+
+  it('ETB + Installment: the first and second payments are computed exactly like the third onward — no reservation-fee folding', () => {
+    // Same figures as real contract 2000000007819. A round-thousands first
+    // payment (25,000) used to be folded into the 1st downpayment; per the
+    // tax team the first and second rows now follow the same rule as every
+    // later row: each payment is its own obligation, on its own VAT-exclusive
+    // principal (the ledger's recorded principal when present, otherwise
+    // total / 1.12), due the 10th of the following month.
     const input = baseInput({
       buyerClassification: 'ETB',
       taxTagging: 'INSTALLMENT',
       paymentRecords: [
-        { paymentDate: new Date('2023-01-05'), totalCollection: 25_000, isSubtotal: false }, // reservation fee
+        { paymentDate: new Date('2023-01-05'), totalCollection: 25_000, isSubtotal: false }, // 1st payment
         {
           paymentDate: new Date('2023-02-15'),
           totalCollection: 8_075,
           paymentPrincipal: 4_531.25,
           paymentVat: 3_543.75,
           isSubtotal: false,
-        }, // 1st downpayment
-        { paymentDate: new Date('2023-03-15'), totalCollection: 8_075, isSubtotal: false },
+        }, // 2nd payment
+        { paymentDate: new Date('2023-03-15'), totalCollection: 8_075, isSubtotal: false }, // 3rd payment
       ],
     });
     const result = computeDeadline(input);
-    // Reservation fee + 1st DP collapse into a single entry anchored on the
-    // 1st DP's date; the third (unrelated) payment stays separate.
-    // Basis = (25,000 / 1.12) + 4,531.25 = 26,852.68; CWT = 26,852.68 * 5%.
-    expect(result.entries).toHaveLength(2);
-    expect(result.entries[0].basisAmount).toBe(1342.63);
-    expect(result.entries[0].date.toISOString().slice(0, 10)).toBe('2023-03-10'); // 10th after the 1st DP's date
-    expect(result.entries[0].description).toContain('reservation fee of 25000');
-    expect(result.entries[0].description).toContain('net of VAT: 22321.43');
-    expect(result.entries[1].basisAmount).toBe(360.49); // (8,075 / 1.12) * 5%, unaffected by the merge
+    expect(result.entries).toHaveLength(3);
+    expect(result.entries[0].basisAmount).toBe(1116.07); // (25,000 / 1.12) * 5% — its own entry
+    expect(result.entries[0].date.toISOString().slice(0, 10)).toBe('2023-02-10');
+    expect(result.entries[1].basisAmount).toBe(226.56); // recorded principal 4,531.25 * 5% — NOT combined with row 1
+    expect(result.entries[1].date.toISOString().slice(0, 10)).toBe('2023-03-10');
+    expect(result.entries[2].basisAmount).toBe(360.49); // (8,075 / 1.12) * 5%
+    expect(result.entries[2].date.toISOString().slice(0, 10)).toBe('2023-04-10');
+    for (const e of result.entries) expect(e.description).not.toContain('reservation fee');
   });
 
   it('ETB + Installment: trusts the recorded principal for the 1st downpayment even when its VAT split is irregular', () => {
@@ -199,55 +568,58 @@ describe('computeDeadline', () => {
 
   it('ETB + Installment: keeps each row correctly matched to its own entry when two rows share a payment date', () => {
     // Regression: real contract 2000000002661 has two rows both dated
-    // 2018-05-21 (OR 3035611 and OR 3035613), the first of which is the 1st
-    // downpayment (merges with the reservation fee). Date-keyed matching
-    // let the second row's entry silently overwrite the first's, giving
-    // both rows the same (wrong) amount.
+    // 2018-05-21 (OR 3035611 and OR 3035613). Date-keyed matching let the
+    // second row's entry silently overwrite the first's, giving both rows
+    // the same (wrong) amount.
     const input = baseInput({
       buyerClassification: 'ETB',
       taxTagging: 'INSTALLMENT',
       paymentRecords: [
-        { paymentDate: new Date('2023-01-05'), totalCollection: 25_000, isSubtotal: false }, // reservation fee
+        { paymentDate: new Date('2023-01-05'), totalCollection: 25_000, isSubtotal: false }, // 1st payment
         {
           paymentDate: new Date('2023-02-15'),
           totalCollection: 2_168_500,
           paymentPrincipal: 1_925_446.43,
           paymentVat: 243_053.57,
           isSubtotal: false,
-        }, // 1st downpayment — merges with reservation fee
+        }, // 2nd payment
         {
           paymentDate: new Date('2023-02-15'), // same date as the row above
           totalCollection: 189_042,
           paymentPrincipal: 168_787.5,
           paymentVat: 20_254.5,
           isSubtotal: false,
-        },
+        }, // 3rd payment
       ],
     });
     const deadline = computeDeadline(input);
-    expect(deadline.entries).toHaveLength(2);
-    // Entry 0: reservation fee (25,000/1.12=22,321.43) + 1st DP principal (1,925,446.43) = 1,947,767.86 * 5%
-    expect(deadline.entries[0].basisAmount).toBe(97388.39);
-    // Entry 1: the second same-date row's OWN principal, untouched by the merge
-    expect(deadline.entries[1].basisAmount).toBe(8439.38); // 168,787.5 * 5%
+    expect(deadline.entries).toHaveLength(3);
+    expect(deadline.entries[0].basisAmount).toBe(1116.07); // (25,000 / 1.12) * 5%
+    expect(deadline.entries[1].basisAmount).toBe(96272.32); // 1,925,446.43 * 5% — its own principal, nothing folded in
+    // The second same-date row keeps its OWN principal, not the previous row's.
+    expect(deadline.entries[2].basisAmount).toBe(8439.38); // 168,787.5 * 5%
 
     // Pass cwtTaxDue equal to the raw sum so no true-up shortfall is added
     // on top — this test is isolating the duplicate-date matching fix, not
     // the true-up behavior (covered separately above).
-    const lines = computePerPaymentLines(input, deadline, 97388.39 + 8439.38, new Date('2025-01-01'));
-    const [, firstDp, secondSameDate] = lines;
-    // Both rows land in the same calendar month (Feb 2023), so per the tax
-    // team's "last row in the month" rule the per-payment TABLE consolidates
-    // their two entries onto the second (last) row — the first downpayment
+    const lines = computePerPaymentLines(input, deadline, 1116.07 + 96272.32 + 8439.38, new Date('2025-01-01'));
+    const [firstPayment, secondPayment, thirdSameDate] = lines;
+    // The first payment is alone in its month, so it carries its own should-be
+    // due and deadline like any other row.
+    expect(firstPayment.shouldBeCwtDue).toBe(1116.07);
+    expect(firstPayment.applicableDeadline?.toISOString().slice(0, 10)).toBe('2023-02-10');
+    // The second and third rows land in the same calendar month (Feb 2023),
+    // so per the tax team's "last row in the month" rule the per-payment
+    // TABLE consolidates their two entries onto the last row — the second
     // row shows no should-be due of its own. `deadline.entries` above stays
-    // unmerged (it drives FIFO aging/the deadline summary), only this
+    // unconsolidated (it drives FIFO aging/the deadline summary); only this
     // per-row display table is consolidated.
-    expect(firstDp.shouldBeCwtDue).toBeNull();
-    expect(secondSameDate.shouldBeCwtDue).toBe(105_827.77); // 97,388.39 + 8,439.38
-    expect(secondSameDate.applicableDeadline?.toISOString().slice(0, 10)).toBe('2023-03-10');
+    expect(secondPayment.shouldBeCwtDue).toBeNull();
+    expect(thirdSameDate.shouldBeCwtDue).toBe(104_711.7); // 96,272.32 + 8,439.38
+    expect(thirdSameDate.applicableDeadline?.toISOString().slice(0, 10)).toBe('2023-03-10');
   });
 
-  it('ETB + Installment: does not merge when the first payment is not round-thousands', () => {
+  it('ETB + Installment: a first payment that is not round-thousands is computed on its own', () => {
     const input = baseInput({
       buyerClassification: 'ETB',
       taxTagging: 'INSTALLMENT',
@@ -258,10 +630,10 @@ describe('computeDeadline', () => {
     });
     const result = computeDeadline(input);
     expect(result.entries).toHaveLength(2);
-    expect(result.entries[0].basisAmount).toBe(376.44); // (8,432.17 / 1.12) * 5%, not merged
+    expect(result.entries[0].basisAmount).toBe(376.44); // (8,432.17 / 1.12) * 5%
   });
 
-  it('ETB + Installment: does not merge a lone round-thousands payment (nothing to merge into)', () => {
+  it('ETB + Installment: a lone round-thousands payment is computed on its own too', () => {
     const input = baseInput({
       buyerClassification: 'ETB',
       taxTagging: 'INSTALLMENT',
@@ -443,8 +815,6 @@ describe('computePerPaymentLines', () => {
       sqmParking: null,
       sqmStorage: null,
       paymentRecords: [
-        // Not round-thousands, so the reservation-fee merge rule doesn't
-        // kick in here.
         { paymentDate: new Date('2020-01-01'), totalCollection: 40_001, isSubtotal: false },
         { paymentDate: new Date('2020-02-01'), totalCollection: 49_999, isSubtotal: false },
       ],
@@ -474,9 +844,8 @@ describe('computePerPaymentLines', () => {
       sqmParking: null,
       sqmStorage: null,
       paymentRecords: [
-        // Not round-thousands, so the reservation-fee merge rule doesn't
-        // kick in here — these are two independent installment payments
-        // that both happen to land in March.
+        // Two independent installment payments that both happen to land in
+        // March.
         { paymentDate: new Date('2020-03-05'), totalCollection: 40_001, isSubtotal: false },
         { paymentDate: new Date('2020-03-20'), totalCollection: 49_999, isSubtotal: false },
       ],
@@ -662,7 +1031,7 @@ describe('computePerPaymentLines', () => {
         buyerClassification: 'ETB',
         taxTagging: 'INSTALLMENT',
         paymentRecords: [
-          { paymentDate: new Date('2018-05-10'), totalCollection: 100_000, isSubtotal: false }, // reservation fee
+          { paymentDate: new Date('2018-05-10'), totalCollection: 100_000, isSubtotal: false }, // 1st payment
           {
             paymentDate: new Date('2018-05-21'),
             totalCollection: 2_168_500,
@@ -805,15 +1174,14 @@ describe('computePerPaymentLines', () => {
       expect(lines[0].penalties).toBeNull();
     });
 
-    it('never computes a difference or penalties for the reservation fee row', () => {
+    it('computes the first payment like any other row: its own should-be due, difference and penalties', () => {
       const input = baseInput({
         buyerClassification: 'ETB',
         taxTagging: 'INSTALLMENT',
-        // The reservation fee (05/10) is the only payment in its month, so
-        // if a CWT file entry happened to land in that same month, it would
-        // (per the "last row of month" rule) attach to this row too — but
-        // it must never produce a difference/penalty since it has no
-        // should-be due of its own.
+        // The first payment (05/10) is alone in its month, so the CWT file
+        // entry in that month attaches to it, and — with the first and second
+        // rows computed exactly like the third onward — it has its own
+        // should-be due to compare that remittance against.
         paymentRecords: [
           { paymentDate: new Date('2018-05-10'), totalCollection: 100_000, isSubtotal: false },
           { paymentDate: new Date('2018-06-21'), totalCollection: 8_075, paymentPrincipal: 4_531.25, isSubtotal: false },
@@ -823,12 +1191,16 @@ describe('computePerPaymentLines', () => {
         ],
       });
       const deadline = computeDeadline(input);
-      const lines = computePerPaymentLines(input, deadline, 4735.87, new Date('2025-01-01'));
+      const lines = computePerPaymentLines(input, deadline, 4690.85, new Date('2025-01-01'));
       expect(lines[0].cwtFileTaxDue).toBe(50); // matched (last/only row in May 2018)
-      expect(lines[0].shouldBeCwtDue).toBeNull(); // reservation fee — no obligation of its own
-      expect(lines[0].difference).toBeNull();
-      expect(lines[0].penalties).toBeNull();
-      expect(lines[0].totalDue).toBeNull();
+      expect(lines[0].shouldBeCwtDue).toBe(4464.29); // (100,000 / 1.12) * 5%
+      expect(lines[0].applicableDeadline?.toISOString().slice(0, 10)).toBe('2018-06-10');
+      expect(lines[0].difference).toBe(4414.29); // 4,464.29 - 50 remitted
+      expect(lines[0].penalties).not.toBeNull();
+      expect(lines[0].totalDue).toBe(round2(4414.29 + lines[0].penalties!.totalPenalties));
+      // The second payment is its own obligation too (recorded principal * 5%).
+      expect(lines[1].shouldBeCwtDue).toBe(226.56);
+      expect(lines[1].applicableDeadline?.toISOString().slice(0, 10)).toBe('2018-07-10');
     });
   });
 
