@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import {
   fetchContract,
+  fetchReferenceConfig,
   ledgerDownloadUrl,
   searchRptTowers,
   updateContract,
@@ -250,6 +251,13 @@ function ManualEntryCard({
   const [zonal, setZonal] = useState<ZonalLookupResult | null>(null);
   const [zonalLoading, setZonalLoading] = useState(false);
   const [compQuery, setCompQuery] = useState('');
+  // Zonal values are reference data: read-only here (locked until the server says otherwise).
+  const [zonalLocked, setZonalLocked] = useState(true);
+  useEffect(() => {
+    fetchReferenceConfig()
+      .then((c) => setZonalLocked(c.locked))
+      .catch(() => setZonalLocked(true));
+  }, []);
 
   async function runZonalLookup() {
     setZonalLoading(true);
@@ -285,8 +293,10 @@ function ManualEntryCard({
         sqmUnit: sqmUnit === '' ? null : Number(sqmUnit),
         sqmParking: sqmParking === '' ? null : Number(sqmParking),
         sqmStorage: sqmStorage === '' ? null : Number(sqmStorage),
-        zonalValuePerSqmUnit: zonalValuePerSqmUnit === '' ? null : Number(zonalValuePerSqmUnit),
-        zonalValuePerSqmParking: zonalValuePerSqmParking === '' ? null : Number(zonalValuePerSqmParking),
+        ...(!zonalLocked && {
+          zonalValuePerSqmUnit: zonalValuePerSqmUnit === '' ? null : Number(zonalValuePerSqmUnit),
+          zonalValuePerSqmParking: zonalValuePerSqmParking === '' ? null : Number(zonalValuePerSqmParking),
+        }),
       });
       onNotice('Saved.');
       onChange();
@@ -374,6 +384,8 @@ function ManualEntryCard({
             type="number"
             step="0.01"
             value={zonalValuePerSqmUnit}
+            readOnly={zonalLocked}
+            title={zonalLocked ? 'Zonal values are loaded from the reference folder and cannot be edited here' : undefined}
             onChange={(e) => setZonalValuePerSqmUnit(e.target.value)}
           />
           <p className="muted" style={{ marginTop: 4, fontSize: '0.8em' }}>
@@ -386,8 +398,15 @@ function ManualEntryCard({
             type="number"
             step="0.01"
             value={zonalValuePerSqmParking}
+            readOnly={zonalLocked}
+            title={zonalLocked ? 'Zonal values are loaded from the reference folder and cannot be edited here' : undefined}
             onChange={(e) => setZonalValuePerSqmParking(e.target.value)}
           />
+          {zonalLocked && (
+            <p className="muted" style={{ marginTop: 4, fontSize: '0.8em' }}>
+              Zonal values are read-only — they come from the Zonal Value reference workbook / DOAS data.
+            </p>
+          )}
         </div>
         <div className="field">
           <label>RDO</label>
@@ -467,15 +486,19 @@ function ManualEntryCard({
                         <td>{m.classification}</td>
                         <td>{formatCurrency(m.value)}</td>
                         <td style={{ display: 'flex', gap: 6 }}>
-                          <button className="btn btn-secondary" onClick={() => setZonalValuePerSqmUnit(String(m.value))}>
-                            Use → Unit/Storage
-                          </button>
-                          <button
-                            className="btn btn-secondary"
-                            onClick={() => setZonalValuePerSqmParking(String(m.value))}
-                          >
-                            Use → Parking
-                          </button>
+                          {!zonalLocked && (
+                            <>
+                              <button className="btn btn-secondary" onClick={() => setZonalValuePerSqmUnit(String(m.value))}>
+                                Use → Unit/Storage
+                              </button>
+                              <button
+                                className="btn btn-secondary"
+                                onClick={() => setZonalValuePerSqmParking(String(m.value))}
+                              >
+                                Use → Parking
+                              </button>
+                            </>
+                          )}
                         </td>
                       </tr>
                     ))}

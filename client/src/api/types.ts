@@ -342,3 +342,76 @@ export interface ContractDetail {
   collectionEvents: CollectionEvent[];
   exposure: ExposureResult;
 }
+
+// ONETT Summary (see server/src/routes/onett.ts).
+export interface OnettSummaryRow {
+  docket: string;
+  buyer: string;
+  location: string;
+  class: string;
+  areaRc: number | null;
+  areaPs: number | null;
+  zvPerSqmRc: number | null;
+  zvPerSqmPs: number | null;
+  zonalValue: number;
+  fmv: number;
+  sellingPrice: number;
+  issue: string;
+  taxType: 'EWT' | 'DST';
+  taxBase: number;
+  taxDue: number;
+  taxPaid: number;
+  surcharge: number;
+  interest: number;
+  compromise: number;
+  remarks: string;
+}
+
+export interface OnettAccountView {
+  docket: string;
+  batch?: string | null;
+  sheetPage?: number;
+  sheetDate?: string;
+  buyers: string[];
+  tins?: string[];
+  sheetNote?: string | null;
+  cts?: string | null;
+  terms?: string | null;
+  schedulePages?: number[];
+  irisPages?: number[];
+  irisFinding?: string | null;
+  handwritten?: string[];
+  rows: OnettSummaryRow[];
+  reviewFlags: string[];
+}
+
+export interface OnettStats {
+  accounts: number;
+  withIris: number;
+  noIris: number;
+  flagged: number;
+  taxBase: number;
+  shortDue: number;
+  surcharge: number;
+  interest: number;
+  compromise: number;
+  total: number;
+}
+
+export interface OnettSummaryInfo {
+  id: number;
+  title: string;
+  customTitle: string | null;
+  files: { name: string; pages: number; startPage: number }[];
+  pageCount: number;
+  status: 'PROCESSING' | 'AWAITING_EXTRACTION' | 'READY' | 'FAILED';
+  statusNote: string | null;
+  createdAt: string;
+  updatedAt: string;
+  stats: OnettStats;
+}
+
+export interface OnettDetail {
+  summary: OnettSummaryInfo;
+  accounts: OnettAccountView[];
+}

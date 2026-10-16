@@ -194,3 +194,22 @@ model EtbRun {
   contractNumbers String[]
   createdAt       DateTime  @default(now())
 }
+
+// ONETT Summary: a batch of scanned ONETT computation sheets (one PDF with many
+// ONETTs, or several PDFs) summarised into the ONETT Summary workbook. The
+// uploaded PDFs and their page images live under uploads/onett/<id>/; the
+// extracted records (one per computation sheet) are the `accounts` JSON.
+model OnettSummary {
+  id         Int      @id @default(autoincrement())
+  // User-editable display name; null = never renamed (falls back to the file name).
+  title      String?
+  // [{ name, pages, startPage }] — the uploaded PDFs in page order.
+  files      Json     @default("[]")
+  pageCount  Int      @default(0)
+  // PROCESSING | AWAITING_EXTRACTION | READY | FAILED
+  status     String   @default("READY")
+  statusNote String?
+  accounts   Json     @default("[]")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}

@@ -1,37 +1,17 @@
 import { useEffect, useState } from 'react';
-import { fetchRdoLocations, fetchZonalValueRegions, uploadOclp1606, uploadRptTowers } from '../api/client';
-import FileDropzone from '../components/FileDropzone';
-
-function useUpload<T>(fn: (file: File) => Promise<T>) {
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<T | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  async function run(file: File) {
-    setBusy(true);
-    setError(null);
-    setResult(null);
-    try {
-      setResult(await fn(file));
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return { busy, result, error, run };
-}
+import { fetchRdoLocations, fetchReferenceConfig, fetchZonalValueRegions } from '../api/client';
 
 export default function ReferenceDataPage() {
-  const oclp = useUpload(uploadOclp1606);
-  const rpt = useUpload(uploadRptTowers);
+  const [config, setConfig] = useState<Awaited<ReturnType<typeof fetchReferenceConfig>> | null>(null);
   const [regions, setRegions] = useState<{ region: string }[] | null>(null);
   const [regionsError, setRegionsError] = useState<string | null>(null);
   const [sourceUrl, setSourceUrl] = useState('https://www.bir.gov.ph/zonal-values');
   const [rdoLocations, setRdoLocations] = useState<{ rdo: string; towers: string[] }[] | null>(null);
 
   useEffect(() => {
+    fetchReferenceConfig()
+      .then(setConfig)
+      .catch(() => undefined);
     fetchZonalValueRegions()
       .then((r) => {
         setRegions(r.regions);
@@ -47,63 +27,52 @@ export default function ReferenceDataPage() {
         <div>
           <h1>Reference data</h1>
           <p className="page-subtitle">
-            Shared lookup files the computations rely on. Most of the time the SharePoint update on the Dashboard keeps
-            these current — upload here only to replace one by hand.
+            Shared lookup files the computations rely on. They are kept current by the folder sync and the SharePoint
+            update on the Dashboard — they are read-only in the app.
           </p>
         </div>
       </div>
 
       <div className="card">
-        <h3 className="card-title">OCLP 1606 Summary</h3>
+        <h3 className="card-title">Source files — read-only</h3>
         <p className="card-subtitle" style={{ marginBottom: 14 }}>
-          Bulk-uploads the FINAL tab: buyer classification, tax tagging, transaction/paid dates, and actual CWT
-          remitted per collection. This can take up to a minute for large files (70k+ rows). Re-uploading replaces
-          collection events for any contract touched by the file.
+          {config?.locked === false
+            ? 'Reference data edits are currently enabled on this server (ALLOW_REFERENCE_EDITS).'
+            : 'The OCLP 1606 Summary, the RPT_ALL TOWERS FMV table and the zonal values cannot be uploaded or edited from the web app.'}{' '}
+          They are loaded only from the configured source folders, so the tax team's files stay the single source of truth.
         </p>
-        <FileDropzone
-          accept=".xlsx,.xls"
-          disabled={oclp.busy}
-          title={oclp.busy ? 'Parsing and importing — this may take a minute…' : 'Drop the OCLP 1606 Summary here'}
-          hint=".xlsx or .xls"
-          onFile={oclp.run}
-        />
-        {oclp.error && (
-          <div className="callout callout-error" style={{ marginBottom: 0 }}>
-            {oclp.error}
-          </div>
-        )}
-        {oclp.result && (
-          <div className="callout callout-success" style={{ marginBottom: 0 }}>
-            Parsed {oclp.result.totalRows} rows — matched {oclp.result.matchedRows} to {oclp.result.contractsUpdated}{' '}
-            existing contract(s); {oclp.result.unmatchedRows} rows had no matching contract on file (expected if the
-            summary covers contracts you haven't uploaded yet).
-          </div>
-        )}
-      </div>
-
-      <div className="card">
-        <h3 className="card-title">RPT_ALL TOWERS.xlsx</h3>
-        <p className="card-subtitle" style={{ marginBottom: 14 }}>
-          Replaces the Fair Market Value reference table wholesale (the "ALL" sheet: Tower, Unit, Fair Market Value).
-          Use the contract detail page to search and match a contract to its FMV record.
+        <table>
+          <thead>
+            <tr>
+              <th>Reference data</th>
+              <th>Loaded from</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>OCLP 1606 Summary (buyer classification, tax tagging, CWT remitted)</td>
+              <td>
+                Folder <strong>{config?.dataSyncFolder ?? '…'}</strong> — picked up by <em>Sync from folder</em> /{' '}
+                <em>Update from SharePoint</em> on the Dashboard
+              </td>
+            </tr>
+            <tr>
+              <td>RPT_ALL TOWERS (Fair Market Value)</td>
+              <td>
+                Folder <strong>{config?.dataSyncFolder ?? '…'}</strong> (same sync)
+              </td>
+            </tr>
+            <tr>
+              <td>Zonal values (ZV RATE workbook)</td>
+              <td>
+                Folder <strong>{config?.zonalValuesFolder ?? '…'}</strong>; per-contract values also fill from DOAS
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p className="muted" style={{ marginTop: 10, marginBottom: 0 }}>
+          To change any of them, replace the file in its source folder and run a sync.
         </p>
-        <FileDropzone
-          accept=".xlsx,.xls"
-          disabled={rpt.busy}
-          title={rpt.busy ? 'Uploading…' : 'Drop RPT_ALL TOWERS.xlsx here'}
-          hint=".xlsx or .xls"
-          onFile={rpt.run}
-        />
-        {rpt.error && (
-          <div className="callout callout-error" style={{ marginBottom: 0 }}>
-            {rpt.error}
-          </div>
-        )}
-        {rpt.result && (
-          <div className="callout callout-success" style={{ marginBottom: 0 }}>
-            Imported {rpt.result.rowsImported} FMV records.
-          </div>
-        )}
       </div>
 
       <div className="card">

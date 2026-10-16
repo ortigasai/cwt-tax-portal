@@ -4,13 +4,31 @@ import { prisma } from '../lib/prisma';
 import { uploadDisk, uploadMemory } from '../lib/upload';
 import { importOclp1606File } from '../services/dataImport';
 import { parseRptTowers } from '../parsers/rptTowersParser';
+import { REFERENCE_LOCKED_MESSAGE, referenceDataLocked } from '../lib/referenceLock';
+import path from 'path';
 
 export const referenceRouter = Router();
+
+// GET /api/reference/config — whether reference data can be changed from the
+// web app, and which source folders it is read from (folder names only).
+referenceRouter.get('/config', (_req, res) => {
+  const folderName = (p: string | undefined) => (p ? path.basename(p.replace(/[\/]+$/, '')) : null);
+  res.json({
+    locked: referenceDataLocked(),
+    message: REFERENCE_LOCKED_MESSAGE,
+    dataSyncFolder: folderName(process.env.DATA_SYNC_DIR),
+    zonalValuesFolder: folderName(process.env.ZONAL_VALUES_DIR ?? process.env.DATA_SYNC_DIR),
+  });
+});
 
 // POST /api/reference/oclp-1606/upload — bulk-import the OCLP 1606 Summary
 // FINAL tab. Only rows whose contract number matches an existing Contract
 // are linked (others are recorded with contractId=null for traceability).
 referenceRouter.post('/oclp-1606/upload', uploadDisk.single('file'), async (req, res) => {
+  if (referenceDataLocked()) {
+    if (req.file) fs.unlink(req.file.path, () => undefined);
+    return res.status(403).json({ error: REFERENCE_LOCKED_MESSAGE });
+  }
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
   try {
@@ -24,6 +42,7 @@ referenceRouter.post('/oclp-1606/upload', uploadDisk.single('file'), async (req,
 // POST /api/reference/rpt-towers/upload — replace the FMV reference table
 // wholesale from RPT_ALL TOWERS.xlsx ("ALL" sheet).
 referenceRouter.post('/rpt-towers/upload', uploadMemory.single('file'), async (req, res) => {
+  if (referenceDataLocked()) return res.status(403).json({ error: REFERENCE_LOCKED_MESSAGE });
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
   const rows = await parseRptTowers(req.file.buffer);

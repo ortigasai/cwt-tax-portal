@@ -4,6 +4,8 @@ import type {
   EtbComputeResponse,
   EtbRunDetail,
   EtbRunSummary,
+  OnettDetail,
+  OnettSummaryInfo,
   ContractSummary,
   RptTowerRecord,
   SharePointUpdateSummary,
@@ -202,16 +204,6 @@ export function uploadCtsFile(contractNumber: string, file: File): Promise<{ ok:
   return uploadFile(`/api/contracts/${encodeURIComponent(contractNumber)}/cts`, file);
 }
 
-export function uploadOclp1606(
-  file: File,
-): Promise<{ totalRows: number; matchedRows: number; unmatchedRows: number; contractsUpdated: number }> {
-  return uploadFile('/api/reference/oclp-1606/upload', file);
-}
-
-export function uploadRptTowers(file: File): Promise<{ rowsImported: number }> {
-  return uploadFile('/api/reference/rpt-towers/upload', file);
-}
-
 export function searchRptTowers(query: string): Promise<RptTowerRecord[]> {
   return request(`/api/reference/rpt-towers/search?q=${encodeURIComponent(query)}`);
 }
@@ -291,4 +283,82 @@ export async function computeDstTransferTax(file: File): Promise<Blob> {
     throw new Error(body.error ?? `Request failed: ${res.status}`);
   }
   return res.blob();
+}
+
+// ONETT Summary: scanned ONETT computation sheets -> summary workbook.
+export function fetchOnettStatus(): Promise<{ autoExtraction: boolean; mode: 'api' | 'cli' | null; note: string }> {
+  return request('/api/onett/status');
+}
+
+export function fetchOnettSummaries(): Promise<OnettSummaryInfo[]> {
+  return request('/api/onett/summaries');
+}
+
+export function fetchOnettSummary(id: number): Promise<OnettDetail> {
+  return request(`/api/onett/summaries/${id}`);
+}
+
+export function createOnettSummary(files: File[], title: string): Promise<OnettSummaryInfo & { problems: string[] }> {
+  const form = new FormData();
+  for (const f of files) form.append('files', f);
+  if (title.trim()) form.append('title', title.trim());
+  return request('/api/onett/summaries', { method: 'POST', body: form });
+}
+
+export function importOnettAccounts(body: { title?: string; summaryId?: number; accounts: unknown }): Promise<OnettDetail> {
+  return request('/api/onett/summaries/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export function renameOnettSummary(id: number, title: string): Promise<OnettDetail> {
+  return request(`/api/onett/summaries/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+}
+
+export function extractOnettSummary(id: number): Promise<OnettSummaryInfo> {
+  return request(`/api/onett/summaries/${id}/extract`, { method: 'POST' });
+}
+
+export function deleteOnettSummary(id: number): Promise<{ deleted: number }> {
+  return request(`/api/onett/summaries/${id}`, { method: 'DELETE' });
+}
+
+export function onettExportUrl(id: number): string {
+  return `${API_URL}/api/onett/summaries/${id}/export.xlsx`;
+}
+
+export function onettPageUrl(id: number, page: number): string {
+  return `${API_URL}/api/onett/summaries/${id}/pages/${page}`;
+}
+
+export function deleteOnettSummaries(ids: number[]): Promise<{ deleted: number }> {
+  return request('/api/onett/summaries/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids }),
+  });
+}
+
+export function removeOnettAccounts(id: number, dockets: string[]): Promise<OnettDetail> {
+  return request(`/api/onett/summaries/${id}/remove-accounts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dockets }),
+  });
+}
+
+// Reference data (1606 Summary, FMV table, zonal values) is read-only in the app.
+export function fetchReferenceConfig(): Promise<{
+  locked: boolean;
+  message: string;
+  dataSyncFolder: string | null;
+  zonalValuesFolder: string | null;
+}> {
+  return request('/api/reference/config');
 }

@@ -8,6 +8,7 @@ import { syncRouter } from './routes/sync';
 import { authRouter } from './routes/auth';
 import { dstTransferTaxRouter } from './routes/dstTransferTax';
 import { etbRouter } from './routes/etb';
+import { onettRouter } from './routes/onett';
 import { requireAuth } from './middleware/requireAuth';
 
 export function createApp(): express.Express {
@@ -31,6 +32,7 @@ export function createApp(): express.Express {
   app.use('/api/sync', syncRouter);
   app.use('/api/dst-transfer-tax', dstTransferTaxRouter);
   app.use('/api/etb', etbRouter);
+  app.use('/api/onett', onettRouter);
 
   app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     console.error(err);

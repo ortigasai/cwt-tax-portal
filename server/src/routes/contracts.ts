@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import JSZip from 'jszip';
 import { prisma } from '../lib/prisma';
+import { REFERENCE_LOCKED_MESSAGE, referenceDataLocked } from '../lib/referenceLock';
 import { uploadMemory, uploadPdfMemory } from '../lib/upload';
 import { parseContractList } from '../parsers/contractListParser';
 import { importCustomerLedgerBuffer } from '../services/dataImport';
@@ -444,6 +445,21 @@ contractsRouter.patch('/:contractNumber', async (req, res) => {
     notes,
   } = req.body as Record<string, unknown>;
 
+  // Zonal values are reference data: while locked they may not be changed
+  // here (re-sending the value already stored is fine, so the form still saves).
+  if (referenceDataLocked() && (zonalValuePerSqmUnit !== undefined || zonalValuePerSqmParking !== undefined)) {
+    const current = await prisma.contract.findUnique({
+      where: { contractNumber: req.params.contractNumber },
+      select: { zonalValuePerSqmUnit: true, zonalValuePerSqmParking: true },
+    });
+    if (!current) return res.status(404).json({ error: 'Contract not found' });
+    const same = (incoming: unknown, stored: { toNumber(): number } | null) =>
+      incoming === undefined || (incoming === null ? stored === null : stored !== null && Number(incoming) === stored.toNumber());
+    if (!same(zonalValuePerSqmUnit, current.zonalValuePerSqmUnit) || !same(zonalValuePerSqmParking, current.zonalValuePerSqmParking)) {
+      return res.status(403).json({ error: REFERENCE_LOCKED_MESSAGE });
+    }
+  }
+
   try {
     const contract = await prisma.contract.update({
       where: { contractNumber: req.params.contractNumber },
@@ -527,6 +543,7 @@ contractsRouter.get('/:contractNumber/cts', async (req, res) => {
 // POST /api/contracts/:contractNumber/collection-events — manually record a
 // CWT remittance event when no OCLP 1606 import row matches this contract.
 contractsRouter.post('/:contractNumber/collection-events', async (req, res) => {
+  if (referenceDataLocked()) return res.status(403).json({ error: REFERENCE_LOCKED_MESSAGE });
   const contract = await prisma.contract.findUnique({ where: { contractNumber: req.params.contractNumber } });
   if (!contract) return res.status(404).json({ error: 'Contract not found' });
 

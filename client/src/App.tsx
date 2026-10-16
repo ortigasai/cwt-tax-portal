@@ -5,17 +5,20 @@ import ContractDetailPage from './pages/ContractDetailPage';
 import UploadPage from './pages/UploadPage';
 import EtbCalculatorPage from './pages/EtbCalculatorPage';
 import EtbDashboardPage from './pages/EtbDashboardPage';
+import OnettDashboardPage from './pages/OnettDashboardPage';
+import OnettUploadPage from './pages/OnettUploadPage';
 import ReferenceDataPage from './pages/ReferenceDataPage';
 import DstTransferTaxPage from './pages/DstTransferTaxPage';
 import LoginPage from './pages/LoginPage';
 import Icon from './components/Icon';
 import { checkAuth, logout, setUnauthorizedHandler } from './api/client';
 
-// Three separate modules, each with its own sub-nav — "DST & Transfer Tax
+// Four separate modules, each with its own sub-nav — "DST & Transfer Tax
 // Review" and the "ETB Calculator" are distinct tools from the CWT Portal
 // (contracts/ledgers/zonal lookups), not just more pages alongside it.
 const DST_TRANSFER_TAX_PREFIX = '/dst-transfer-tax';
 const ETB_PREFIX = '/etb';
+const ONETT_PREFIX = '/onett';
 
 function App() {
   const [authState, setAuthState] = useState<'checking' | 'in' | 'out'>('checking');
@@ -42,7 +45,8 @@ function App() {
 
   const inDstModule = location.pathname.startsWith(DST_TRANSFER_TAX_PREFIX);
   const inEtbModule = location.pathname.startsWith(ETB_PREFIX);
-  const inCwtModule = !inDstModule && !inEtbModule;
+  const inOnettModule = location.pathname.startsWith(ONETT_PREFIX);
+  const inCwtModule = !inDstModule && !inEtbModule && !inOnettModule;
 
   return (
     <div className="app-shell">
@@ -53,13 +57,17 @@ function App() {
         </div>
         <div className="app-modules">
           <Link to="/" className={inCwtModule ? 'active' : undefined}>
-            CWT Portal
-          </Link>
-          <Link to={DST_TRANSFER_TAX_PREFIX} className={inDstModule ? 'active' : undefined}>
-            DST &amp; Transfer Tax Review
+            Pre-ONETT
           </Link>
           <Link to={ETB_PREFIX} className={inEtbModule ? 'active' : undefined}>
             ETB Calculator
+          </Link>
+          <Link to={ONETT_PREFIX} className={inOnettModule ? 'active' : undefined}>
+            ONETT Summary
+          </Link>
+          {/* Always the last button in this row. */}
+          <Link to={DST_TRANSFER_TAX_PREFIX} className={inDstModule ? 'active' : undefined}>
+            DST &amp; Transfer Tax Review
           </Link>
         </div>
         <div className="app-header-actions">
@@ -74,6 +82,13 @@ function App() {
             <NavLink to={DST_TRANSFER_TAX_PREFIX} end>
               DST &amp; Transfer Tax Review
             </NavLink>
+          </nav>
+        ) : inOnettModule ? (
+          <nav>
+            <NavLink to={ONETT_PREFIX} end>
+              ONETT Dashboard
+            </NavLink>
+            <NavLink to={`${ONETT_PREFIX}/upload`}>New Summary</NavLink>
           </nav>
         ) : inEtbModule ? (
           <nav>
@@ -99,6 +114,8 @@ function App() {
           <Route path="/upload" element={<UploadPage />} />
           <Route path={ETB_PREFIX} element={<EtbDashboardPage />} />
           <Route path={`${ETB_PREFIX}/calculator`} element={<EtbCalculatorPage />} />
+          <Route path={ONETT_PREFIX} element={<OnettDashboardPage />} />
+          <Route path={`${ONETT_PREFIX}/upload`} element={<OnettUploadPage />} />
           <Route path="/reference" element={<ReferenceDataPage />} />
           <Route path={DST_TRANSFER_TAX_PREFIX} element={<DstTransferTaxPage />} />
         </Routes>
