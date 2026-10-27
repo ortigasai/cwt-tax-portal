@@ -24,6 +24,8 @@
 //    "reservation fee" row (the current LedgerFit ledger already splits
 //    principal and VAT correctly on those rows).
 
+import { isProjectedYear, nextBusinessDay } from '../lib/phHolidays';
+
 export type BuyerClassification = 'INDIVIDUAL' | 'ETB' | 'CORPORATION' | 'UNKNOWN';
 export type TaxTagging = 'INSTALLMENT' | 'CASH_DEFERRED' | 'AR_SALE' | 'UNKNOWN';
 
@@ -57,6 +59,9 @@ export interface CollectionEventInput {
 
 export interface ContractComputationInput {
   netTCP: number | null;
+  // Total Contract Price (VAT-inclusive) — the base of the 25% Cash Deferred test,
+  // measured against Total Collection (also VAT-inclusive).
+  totalTCP?: number | null;
   fmvPerTaxDeclarationUnit: number | null;
   fmvPerTaxDeclarationParking: number | null;
   fmvPerTaxDeclarationStorage: number | null;
@@ -73,6 +78,10 @@ export interface ContractComputationInput {
   // When set (ETB Calculator), only payments on/after this date carry a
   // per-collection ETB obligation. Leave unset for the normal computation.
   etbStartDate?: Date | null;
+  // Set when the stored tagging was INSTALLMENT but the ledger shows the 25%
+  // rule was breached (see initialPaymentsExceedThreshold), so the contract is
+  // computed as Cash Deferred. Only used to explain that in the deadline note.
+  cashDeferredByRule?: { storedTagging: TaxTagging; year: number; triggerDate: Date } | null;
   paymentRecords: PaymentRecordInput[];
   collectionEvents: CollectionEventInput[];
 }
@@ -96,6 +105,15 @@ export interface PenaltyBreakdown {
   interestRate: number;
   daysLate: number;
   totalPenalties: number;
+}
+
+export interface PenaltyWorking {
+  base: number; // lateParts amounts + unpaid
+  unpaid: number;
+  lateParts: { amount: number; paidAt: Date; days: number }[];
+  unpaidDays: number; // days from the deadline to asOf (0 when nothing is unpaid)
+  asOf: Date;
+  rate: number; // 0.12, or 0.20 for deadlines before 2018
 }
 
 export interface PerPaymentLine {
@@ -139,6 +157,11 @@ export interface PerPaymentLine {
   // as the contract-level penalty calculation, anchored on this row's own
   // applicable deadline and variance.
   penalties: PenaltyBreakdown | null;
+  // How `penalties` was worked out, so the ledger can show it as Excel formulas:
+  // the penalty base is the late-paid portions plus what is still unpaid; each
+  // late-paid portion runs interest from the deadline to the day it was paid,
+  // the unpaid part to the as-of date. Null whenever `penalties` is.
+  penaltyWorking: PenaltyWorking | null;
   // The full amount owed for this row: Difference + Total Penalties. Null
   // whenever there are no penalties (no exposure on this row, or nothing to
   // compare), matching the same gating as `penalties`.
@@ -204,9 +227,11 @@ export function normalizeTaxTagging(raw: string | null | undefined): TaxTagging 
 }
 
 function addMonthsTenth(date: Date): Date {
-  // 10th day of the month following `date`.
-  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 10));
-  return d;
+  // 10th day of the month following `date` — moved to the next business day
+  // when that 10th is a Saturday, Sunday or holiday (e.g. a Sunday May 10 is due
+  // Monday May 11). Every deadline, its on-time test and its interest clock use
+  // this adjusted date.
+  return nextBusinessDay(new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 10)));
 }
 
 // The set of payment records that can trigger a CWT obligation (dated,
@@ -291,16 +316,45 @@ function individualInstallmentTriggerRow(paymentRecords: PaymentRecordInput[]): 
   return triggerable[triggerable.length - 1] ?? null;
 }
 
+// The 25% rule. A sale only qualifies as an installment sale when the initial
+// payments — what the buyer pays in the year of the sale — do not exceed 25% of
+// the selling price (Total Contract Price, VAT-inclusive like Total Collection). When the ledger shows collections in the year of
+// the first payment already above 25% of the Total Contract Price, the account is treated as
+// Cash Deferred whatever it is tagged (Installment, ETB, Individual, …): the CWT
+// is then due in full by the 10th of the month after that payment, and anything
+// remitted later carries penalties. The measure is the same cumulative Total
+// Collection the Cash Deferred deadline already uses.
+export const INITIAL_PAYMENT_THRESHOLD = 0.25;
+
+export function initialPaymentsExceedThreshold(
+  paymentRecords: PaymentRecordInput[],
+  totalTCP: number | null,
+): { exceeded: boolean; year: number | null; triggerDate: Date | null } {
+  const none = { exceeded: false, year: null, triggerDate: null };
+  if (totalTCP === null || totalTCP <= 0) return none;
+  const rows = triggerablePayments(paymentRecords);
+  if (rows.length === 0) return none;
+  const year = rows[0].paymentDate!.getUTCFullYear();
+  const threshold = INITIAL_PAYMENT_THRESHOLD * totalTCP;
+  let cumulative = 0;
+  for (const r of rows) {
+    if (r.paymentDate!.getUTCFullYear() !== year) break;
+    cumulative += r.totalCollection!;
+    if (cumulative > threshold) return { exceeded: true, year, triggerDate: r.paymentDate! };
+  }
+  return { exceeded: false, year, triggerDate: null };
+}
+
 // The single row whose payment date anchors the deadline for Cash Deferred
-// (first payment where cumulative collections exceed 25% of Net TCP). When
+// (first payment where cumulative collections exceed 25% of the Total Contract Price). When
 // multiple payments share that triggering payment's calendar month, the
 // deadline and Should-Be CWT Due are attached to the LAST such row, not the
 // exact row that crossed the threshold — the same "last row in the month"
 // convention already used for CWT file matching (see matchCwtFileByMonth),
 // per tax team direction.
-function cashDeferredTriggerRow(paymentRecords: PaymentRecordInput[], netTCP: number): PaymentRecordInput | null {
+function cashDeferredTriggerRow(paymentRecords: PaymentRecordInput[], totalTCP: number): PaymentRecordInput | null {
   const triggerable = triggerablePayments(paymentRecords);
-  const threshold = 0.25 * netTCP;
+  const threshold = INITIAL_PAYMENT_THRESHOLD * totalTCP;
   let cumulative = 0;
   let triggerRow: PaymentRecordInput | null = null;
   for (const r of triggerable) {
@@ -468,7 +522,7 @@ export function computeCwtTaxBase(input: {
 }
 
 export function computeDeadline(input: ContractComputationInput): DeadlineResult {
-  const { buyerClassification: bc, taxTagging: tag, paymentRecords, netTCP } = input;
+  const { buyerClassification: bc, taxTagging: tag, paymentRecords, totalTCP } = input;
 
   if (tag === 'AR_SALE') {
     if (input.manualDeadlineOverride) {
@@ -528,22 +582,27 @@ export function computeDeadline(input: ContractComputationInput): DeadlineResult
   }
 
   if (tag === 'CASH_DEFERRED') {
-    if (netTCP === null || netTCP <= 0) {
-      return { entries: [], primaryDeadline: null, note: 'Insufficient payment records or Net TCP to evaluate the 25% cumulative-collection threshold.' };
+    if (totalTCP == null || totalTCP <= 0) {
+      return { entries: [], primaryDeadline: null, note: 'Insufficient payment records or Total Contract Price to evaluate the 25% cumulative-collection threshold.' };
     }
-    const trigger = cashDeferredTriggerRow(paymentRecords, netTCP);
+    const trigger = cashDeferredTriggerRow(paymentRecords, totalTCP);
     if (!trigger?.paymentDate) {
       return {
         entries: [],
         primaryDeadline: null,
-        note: 'Cash Deferred: cumulative collections have not yet exceeded 25% of Net TCP — no deadline triggered.',
+        note: 'Cash Deferred: cumulative collections have not yet exceeded 25% of the Total Contract Price — no deadline triggered.',
       };
     }
     const date = addMonthsTenth(trigger.paymentDate);
+    const byRule = input.cashDeferredByRule;
     return {
-      entries: [{ date, basisAmount: 0, description: 'Cumulative collections exceeded 25% of Net TCP on this payment' }],
+      entries: [{ date, basisAmount: 0, description: 'Cumulative collections exceeded 25% of the Total Contract Price on this payment' }],
       primaryDeadline: date,
-      note: 'Cash Deferred: deadline is 10th day of month following the payment when cumulative collections first exceed 25% of Net TCP.',
+      note:
+        'Cash Deferred: deadline is 10th day of month following the payment when cumulative collections first exceed 25% of the Total Contract Price (the next business day if the 10th is a weekend or holiday).' +
+        (byRule
+          ? ` Stored as ${byRule.storedTagging === 'INSTALLMENT' ? 'Installment' : byRule.storedTagging}, but collections in ${byRule.year} (the year of the first payment) already exceeded 25% of the Total Contract Price on ${formatMDY(byRule.triggerDate)} — so the sale is treated as Cash Deferred and the full CWT was due then.`
+          : ''),
     };
   }
 
@@ -630,10 +689,9 @@ function applySettlement(
   for (const { line, index } of order) {
     const deadline = line.applicableDeadline!;
     const deadlineMs = deadline.getTime();
-    // A deadline that falls on a weekend is met by paying on the next working
-    // day (Saturday/Sunday -> Monday). Public holidays are not modelled.
-    const dueDay = deadline.getUTCDay();
-    const onTimeUntilMs = deadlineMs + (dueDay === 6 ? 2 : dueDay === 0 ? 1 : 0) * msPerDay;
+    // The deadline already is a business day (a weekend/holiday 10th was moved
+    // forward by addMonthsTenth), so paying on it is on time.
+    const onTimeUntilMs = deadlineMs;
     let need = line.shouldBeCwtDue!;
     const portions: { amount: number; at: number }[] = [];
     for (const r of remittances) {
@@ -650,6 +708,7 @@ function applySettlement(
     const base = round2(lateAmount + unpaid);
 
     let penalties: PenaltyBreakdown | null = null;
+    let penaltyWorking: PenaltyWorking | null = null;
     if (base > EXPOSURE_ROUNDING_TOLERANCE) {
       const rate = deadline < POST_2018_CUTOFF ? 0.2 : 0.12;
       const daysTo = (ms: number) => Math.max(0, Math.floor((ms - deadlineMs) / msPerDay));
@@ -667,6 +726,14 @@ function applySettlement(
         interest += unpaid * rate * (d / 365);
         daysLate = Math.max(daysLate, d);
       }
+      penaltyWorking = {
+        base,
+        unpaid: round2(unpaid),
+        lateParts: late.map((p) => ({ amount: p.amount, paidAt: new Date(p.at), days: daysTo(p.at) })),
+        unpaidDays: unpaid > 0 ? daysTo(asOfDate.getTime()) : 0,
+        asOf: asOfDate,
+        rate,
+      };
       const surcharge = round2(0.25 * base);
       const compromisePenalty = compromisePenaltyFor(base);
       const interestRounded = round2(interest);
@@ -689,6 +756,7 @@ function applySettlement(
       ...line,
       difference: penalties === null && difference !== null && difference > EXPOSURE_ROUNDING_TOLERANCE ? 0 : difference,
       penalties,
+      penaltyWorking,
       totalDue: penalties ? round2(unpaid + penalties.totalPenalties) : null,
       // Settled on or before the deadline although the month match said short.
       paidInAdvance:
@@ -778,6 +846,7 @@ function buildPerPaymentLines(
       remittedInDeadlineMonth,
       difference,
       penalties,
+      penaltyWorking: null,
       totalDue,
       coveredByBulkRemittance,
       paidInAdvance: false,
@@ -804,6 +873,7 @@ function buildPerPaymentLines(
     remittedInDeadlineMonth: null,
     difference: null,
     penalties: null,
+    penaltyWorking: null,
     totalDue: null,
     coveredByBulkRemittance: false,
     paidInAdvance: false,
@@ -813,7 +883,7 @@ function buildPerPaymentLines(
     return [...allRows.map((r) => toLine(r, null, null)), ...unmatchedLines];
   }
 
-  const { buyerClassification: bc, taxTagging: tag, paymentRecords, netTCP } = input;
+  const { buyerClassification: bc, taxTagging: tag, paymentRecords, totalTCP } = input;
 
   if (tag === 'INSTALLMENT' && (bc === 'ETB' || bc === 'CORPORATION')) {
     // `rows` and `deadline.entries` are derived from the identical
@@ -874,8 +944,8 @@ function buildPerPaymentLines(
     ];
   }
 
-  if (tag === 'CASH_DEFERRED' && netTCP !== null && netTCP > 0) {
-    const trigger = cashDeferredTriggerRow(paymentRecords, netTCP);
+  if (tag === 'CASH_DEFERRED' && totalTCP != null && totalTCP > 0) {
+    const trigger = cashDeferredTriggerRow(paymentRecords, totalTCP);
     return [
       ...allRows.map((row) => {
         const [shouldBe, deadlineDate] = dueOnRow(row, trigger);
@@ -933,6 +1003,23 @@ export function computeExposure(input: ContractComputationInput, asOfDate: Date 
     deadline = {
       ...deadline,
       note: `${deadline.note} CWT remitted in advance already covered ${advanceCount} payment(s) — no shortfall or penalty on those rows.`,
+    };
+  }
+
+  // A deadline that falls in a year with no holiday proclamation on file was
+  // moved off weekends/holidays using a projected calendar — say so.
+  const projectedYears = [
+    ...new Set(
+      [deadline.primaryDeadline, ...deadline.entries.map((e) => e.date)]
+        .filter((d): d is Date => d !== null)
+        .map((d) => d.getUTCFullYear())
+        .filter(isProjectedYear),
+    ),
+  ].sort();
+  if (projectedYears.length > 0) {
+    deadline = {
+      ...deadline,
+      note: `${deadline.note} Note: no holiday proclamation is on file for ${projectedYears.join(', ')}, so weekend/holiday adjustments use a projected holiday calendar — re-check once the Palace issues it.`,
     };
   }
 

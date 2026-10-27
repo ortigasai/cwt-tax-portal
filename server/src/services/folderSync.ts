@@ -214,7 +214,8 @@ export async function syncFromFolder(opts: { force?: boolean } = {}): Promise<Sy
       const existingSet = new Set(existing.map((c) => c.contractNumber));
       const toCreate = [...wanted].filter((n) => !existingSet.has(n));
       if (toCreate.length > 0) {
-        const batchNumber = (await prisma.importBatch.count({ where: { type: 'CONTRACT_LIST' } })) + 1;
+        const lastBatch = await prisma.importBatch.aggregate({ where: { type: 'CONTRACT_LIST' }, _max: { batchNumber: true } });
+        const batchNumber = (lastBatch._max.batchNumber ?? 0) + 1;
         const batchDate = new Date();
         for (const n of toCreate) {
           const created = await prisma.contract.create({ data: { contractNumber: n, batchNumber, batchDate } });

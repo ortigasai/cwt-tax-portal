@@ -1,3 +1,4 @@
+import { generateDashboardStatusExcel } from '../generators/dashboardStatusExcel';
 import { Router } from 'express';
 import JSZip from 'jszip';
 import { prisma } from '../lib/prisma';
@@ -11,6 +12,7 @@ import {
   ComputationOverride,
   computeContractExposure,
   ContractWithRelations,
+  analyzeTagging,
   deriveAnalysis,
   deriveDisplayFields,
   etbOverride,
@@ -19,7 +21,12 @@ import { parseIsoDate } from '../lib/isoDate';
 import { nonCurrentClearingDocs } from '../lib/clearingSeries';
 import { describeLedgerfitSession, lookupLedgerfitSession } from '../services/ledgerfitStatus';
 import { saveManualOverride, applyManualOverrideIfAny } from '../services/manualOverrides';
-import { generateLedgerExcel } from '../generators/ledgerExcelGenerator';
+import {
+  generateBatchDuplicatesExcel,
+  generateLedgerExcel,
+  type BatchDuplicateEntry,
+  type LedgerExportInput,
+} from '../generators/ledgerExcelGenerator';
 import { contractFilePath, UPLOADS_DIR } from '../lib/fileStorage';
 import fs from 'fs';
 import path from 'path';
@@ -57,6 +64,7 @@ function summarize(contract: ContractWithRelations, batchTitles?: Map<number, st
     tower: contract.tower,
     unit: contract.unit,
     taxTagging: display.taxTagging,
+    taxTaggingNote: display.taxTaggingNote,
     buyerClassification: display.buyerClassification,
     cwtTaxBase: exposure.cwtTaxBase,
     cwtTaxDue: exposure.cwtTaxDue,
@@ -91,10 +99,15 @@ export async function buildLedgerBuffer(
   contract: ContractWithRelations,
   override?: ComputationOverride,
 ): Promise<Buffer> {
+  return generateLedgerExcel(buildLedgerInput(contract, override));
+}
+
+// Everything the ledger workbook needs for one contract.
+export function buildLedgerInput(contract: ContractWithRelations, override?: ComputationOverride): LedgerExportInput {
   const exposure = computeContractExposure(contract, new Date(), override);
   const display = deriveDisplayFields(contract, override);
 
-  return generateLedgerExcel({
+  return {
     contractNumber: contract.contractNumber,
     buyerName: contract.buyerName,
     estate: contract.estate,
@@ -103,7 +116,7 @@ export async function buildLedgerBuffer(
     totalTCP: toNum(contract.totalTCP),
     netTCP: toNum(contract.netTCP),
     buyerClassification: display.buyerClassification,
-    taxTagging: display.taxTagging,
+    taxTagging: display.taxTaggingNote ? `${display.taxTagging} (${display.taxTaggingNote})` : display.taxTagging,
     fmvPerTaxDeclarationUnit: display.fmvPerTaxDeclarationUnit,
     fmvPerTaxDeclarationParking: display.fmvPerTaxDeclarationParking,
     fmvPerTaxDeclarationStorage: display.fmvPerTaxDeclarationStorage,
@@ -114,6 +127,7 @@ export async function buildLedgerBuffer(
     sqmStorage: toNum(contract.sqmStorage),
     ctsNotaryDate: contract.ctsNotaryDate,
     rdo: display.rdo,
+    taggingAnalysis: analyzeTagging(contract),
     paymentRecords: contract.paymentRecords.map((p) => ({
       paymentDate: p.paymentDate,
       totalCollection: toNum(p.totalCollection),
@@ -124,7 +138,7 @@ export async function buildLedgerBuffer(
       isSubtotal: p.isSubtotal,
     })),
     exposure,
-  });
+  };
 }
 
 // POST /api/contracts/retrieve-cts-data — fill CTS notary date / SQM / zonal
@@ -149,9 +163,12 @@ contractsRouter.post('/upload-list', uploadMemory.single('file'), async (req, re
     return res.status(400).json({ error: 'No contract numbers found in the uploaded file' });
   }
 
-  // Assign this upload the next sequential batch number. New contracts are
-  // tagged with it (via the create branch); existing ones keep their batch.
-  const batchNumber = (await prisma.importBatch.count({ where: { type: 'CONTRACT_LIST' } })) + 1;
+  // Assign this upload the next batch number (highest so far + 1, so removing a
+  // batch record never makes a number get reused). Every contract in the file is
+  // tagged with it — a contract that already existed moves to this newest batch,
+  // otherwise a re-uploaded list would leave its batch with nothing to show.
+  const lastBatch = await prisma.importBatch.aggregate({ where: { type: 'CONTRACT_LIST' }, _max: { batchNumber: true } });
+  const batchNumber = (lastBatch._max.batchNumber ?? 0) + 1;
   const batchDate = new Date();
 
   let created = 0;
@@ -159,7 +176,7 @@ contractsRouter.post('/upload-list', uploadMemory.single('file'), async (req, re
   for (const contractNumber of contractNumbers) {
     const result = await prisma.contract.upsert({
       where: { contractNumber },
-      update: {},
+      update: { batchNumber, batchDate },
       create: { contractNumber, batchNumber, batchDate },
     });
     if (result.createdAt.getTime() === result.updatedAt.getTime()) {
@@ -229,6 +246,51 @@ contractsRouter.get('/', async (_req, res) => {
   res.json(contracts.map((c) => summarize(c, batchTitles)));
 });
 
+// POST /api/contracts/status.xlsx — the dashboard as an Excel file: one row per
+// contract with its status, analysis state and every missing item, plus a
+// Summary sheet. Body: { contractNumbers?: string[] } — the contracts shown on
+// the dashboard (default: all of them).
+contractsRouter.post('/status.xlsx', async (req, res) => {
+  const raw = (req.body as { contractNumbers?: unknown }).contractNumbers;
+  const only = Array.isArray(raw) ? raw.map((n) => String(n)).filter(Boolean) : null;
+  const contracts = await prisma.contract.findMany({
+    where: only ? { contractNumber: { in: only } } : undefined,
+    include: contractInclude,
+    orderBy: { createdAt: 'asc' },
+  });
+  const batchTitles = await loadBatchTitles();
+  const rows = contracts.map((c) => {
+    const sum = summarize(c, batchTitles);
+    return {
+      contractNumber: sum.contractNumber,
+      buyerName: sum.buyerName,
+      tower: sum.tower,
+      unit: sum.unit,
+      batchNumber: sum.batchNumber,
+      batchTitle: sum.batchTitle,
+      batchDate: sum.batchDate,
+      buyerClassification: sum.buyerClassification,
+      taxTagging: sum.taxTagging,
+      taxTaggingNote: sum.taxTaggingNote,
+      ctsNotaryDate: c.ctsNotaryDate,
+      netTCP: toNum(c.netTCP),
+      cwtTaxBase: sum.cwtTaxBase,
+      cwtTaxDue: sum.cwtTaxDue,
+      actualRemitted: sum.actualRemitted,
+      variance: sum.variance,
+      totalPenalties: sum.totalPenalties,
+      status: sum.status,
+      analysisState: sum.analysis.state,
+      missing: sum.analysis.missing,
+    };
+  });
+  const buffer = await generateDashboardStatusExcel(rows);
+  const stamp = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="Pre-ONETT Dashboard Status - ${stamp}.xlsx"`);
+  res.send(buffer);
+});
+
 async function loadBatchTitles(): Promise<Map<number, string>> {
   const batches = await prisma.importBatch.findMany({
     where: { type: 'CONTRACT_LIST', batchNumber: { not: null } },
@@ -287,6 +349,48 @@ contractsRouter.patch('/batches/:batchNumber', async (req, res) => {
     title: updated ? batchDisplayTitle(updated) : title,
     customTitle: updated?.title ?? null,
   });
+});
+
+// Ready contracts of a batch (analysis not Pending), with the ledger input of each.
+async function readyBatchEntries(batchNumber: number, includePending: boolean) {
+  const contracts = await prisma.contract.findMany({
+    where: { batchNumber },
+    include: contractInclude,
+    orderBy: { contractNumber: 'asc' },
+  });
+  const entries: BatchDuplicateEntry[] = [];
+  for (const contract of contracts) {
+    const analysis = deriveAnalysis(contract);
+    if (analysis.state === 'PENDING' && !includePending) continue;
+    entries.push({
+      input: buildLedgerInput(contract),
+      analysisLabel: analysis.state === 'DONE' ? 'Done' : analysis.state === 'PROVISIONAL' ? 'Provisional' : 'Pending',
+    });
+  }
+  return { entries, total: contracts.length };
+}
+
+async function batchTitleFor(batchNumber: number): Promise<string> {
+  const batch = await prisma.importBatch.findFirst({ where: { type: 'CONTRACT_LIST', batchNumber } });
+  return batch ? batchDisplayTitle(batch) : `Batch ${batchNumber}`;
+}
+
+const safeFilePart = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 50);
+
+// GET /api/contracts/batches/:batchNumber/duplicates.xlsx[?includePending=1] —
+// ONE Excel file for the batch: an Index sheet plus every ready contract's
+// "Tax Payment Ledger - Duplicate" sheet (instead of a ZIP of separate files).
+contractsRouter.get('/batches/:batchNumber/duplicates.xlsx', async (req, res) => {
+  const batchNumber = Number(req.params.batchNumber);
+  if (!Number.isInteger(batchNumber)) return res.status(400).json({ error: 'Invalid batch number' });
+  const { entries } = await readyBatchEntries(batchNumber, req.query.includePending === '1');
+  if (entries.length === 0) return res.status(404).json({ error: 'No contracts in this batch are ready yet' });
+  const title = await batchTitleFor(batchNumber);
+  const buffer = await generateBatchDuplicatesExcel(entries, { title: `Batch ${batchNumber} — ${title}` });
+  const stamp = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="TaxPaymentLedgers_Batch${batchNumber}_${safeFilePart(title)}_${stamp}.xlsx"`);
+  res.send(buffer);
 });
 
 // GET /api/contracts/ledgers.zip[?batchNumber=N | ?contractNumbers=a,b,c] —

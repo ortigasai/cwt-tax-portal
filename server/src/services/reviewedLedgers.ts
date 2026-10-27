@@ -1,4 +1,5 @@
 import ExcelJS from 'exceljs';
+import { doasFetch } from './doasAuth';
 
 // The payment ledger source of truth: the DOAS system's "Reviewed & Accepted"
 // ledgers (<DOAS_API_URL>/reviewed-ledgers). These are LedgerFit's corrected,
@@ -14,7 +15,6 @@ import ExcelJS from 'exceljs';
 // LedgerFit's export layout, so parsing, storage and the 14-series check are
 // the same as for any ledger file.
 
-const BASE_URL = (process.env.DOAS_API_URL ?? 'http://192.168.16.239:4100').replace(/\/+$/, '');
 const TIMEOUT_MS = 60_000;
 const LIST_TTL_MS = 2 * 60_000;
 
@@ -61,7 +61,7 @@ export interface ReviewedLedger {
 }
 
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE_URL}${path}`, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  const res = await doasFetch(path, TIMEOUT_MS);
   if (!res.ok) throw new Error(`${path} → HTTP ${res.status}`);
   return (await res.json()) as T;
 }

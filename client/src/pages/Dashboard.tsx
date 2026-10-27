@@ -7,15 +7,19 @@ import {
   updateFromSharePoint,
   deleteContracts,
   allLedgersDownloadUrl,
+  batchDuplicatesUrl,
   ledgerDownloadUrl,
   selectedLedgersDownloadUrl,
   renameBatch,
   retrieveCtsData,
+  downloadDashboardStatus,
 } from '../api/client';
 import type { ContractSummary, CtsDataResult, ExposureStatus, SharePointUpdateSummary, SyncStatus } from '../api/types';
 import { formatCurrency, formatDate } from '../utils/format';
 import StatusBadge from '../components/StatusBadge';
+import MissingItems from '../components/MissingItems';
 import Icon from '../components/Icon';
+import DoasConnection from '../components/DoasConnection';
 
 const POLL_INTERVAL_MS = 15_000;
 
@@ -28,23 +32,33 @@ interface BatchGroup {
   batchTitle: string | null;
   batchDate: string | null;
   count: number;
+  ready: number; // analysis done or provisional
 }
 
 function groupByBatch(contracts: ContractSummary[]): BatchGroup[] {
   const map = new Map<number, BatchGroup>();
   for (const c of contracts) {
     if (c.batchNumber == null) continue;
+    const ready = c.analysis && c.analysis.state !== 'PENDING' ? 1 : 0;
     const existing = map.get(c.batchNumber);
-    if (existing) existing.count += 1;
-    else
+    if (existing) {
+      existing.count += 1;
+      existing.ready += ready;
+    } else
       map.set(c.batchNumber, {
         batchNumber: c.batchNumber,
         batchTitle: c.batchTitle,
         batchDate: c.batchDate,
         count: 1,
+        ready,
       });
   }
   return [...map.values()].sort((a, b) => a.batchNumber - b.batchNumber);
+}
+
+function formatHour(hour: number): string {
+  const h12 = hour % 12 === 0 ? 12 : hour % 12;
+  return `${h12}:00 ${hour < 12 ? 'AM' : 'PM'}`;
 }
 
 // A real instant (not a pure calendar date), so the date portion is shown in
@@ -174,6 +188,8 @@ export default function Dashboard() {
   // Table view state: search text, status filter, and sort.
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
+  const [exporting, setExporting] = useState(false);
+  const [exportingBatch, setExportingBatch] = useState<number | null>(null);
   const [sort, setSort] = useState<{ key: SortKey; dir: 'asc' | 'desc' } | null>(null);
 
   const load = (background: boolean) => {
@@ -391,6 +407,19 @@ export default function Dashboard() {
   const analysisProvisional = contracts.filter((c) => c.analysis?.state === 'PROVISIONAL').length;
   const batches = groupByBatch(contracts);
 
+  const exportStatus = () => {
+    setExporting(true);
+    downloadDashboardStatus(visible.map((c) => c.contractNumber))
+      .catch((e: Error) => window.alert(`Could not export: ${e.message}`))
+      .finally(() => setExporting(false));
+  };
+  // The status workbook of one upload batch (all its contracts, ready or not).
+  const exportBatchStatus = (batchNumber: number) => {
+    setExportingBatch(batchNumber);
+    downloadDashboardStatus(contracts.filter((c) => c.batchNumber === batchNumber).map((c) => c.contractNumber))
+      .catch((e: Error) => window.alert(`Could not export: ${e.message}`))
+      .finally(() => setExportingBatch(null));
+  };
   const readyVisible = visible.filter((c) => c.analysis && c.analysis.state !== 'PENDING').map((c) => c.contractNumber);
   const selectedReady = visible
     .filter((c) => selected.has(c.contractNumber) && c.analysis && c.analysis.state !== 'PENDING')
@@ -450,7 +479,13 @@ export default function Dashboard() {
           <div>
             <h3 className="card-title">Data sources</h3>
             <p className="card-subtitle">
-              Nothing syncs automatically. Last synced: {formatSyncTime(syncStatus?.last?.ranAt)}
+              {syncStatus?.schedule?.enabled
+                ? `Updates from SharePoint automatically every day at ${formatHour(syncStatus.schedule.hour)} (next: ${formatSyncTime(syncStatus.schedule.nextRunAt)}). You can also refresh by hand. `
+                : 'Nothing syncs automatically — use the buttons below. '}
+              Last synced: {formatSyncTime(syncStatus?.last?.ranAt)}
+              {syncStatus?.schedule?.lastRun && !syncStatus.schedule.lastRun.ok
+                ? ` · last ${syncStatus.schedule.lastRun.trigger} update failed: ${syncStatus.schedule.lastRun.error}`
+                : ''}
               {syncStatus?.last && syncStatus.last.errors.length > 0 ? ` · ${syncStatus.last.errors.length} error(s)` : ''}
             </p>
           </div>
@@ -471,6 +506,7 @@ export default function Dashboard() {
           {syncStatus?.dataDir ? ` (${syncStatus.dataDir})` : ''}, refresh the shared SharePoint files, or fill any
           missing CTS notary date / SQM / zonal value from the DOAS endorsement batches.
         </p>
+        <DoasConnection />
         {ctsError && (
           <div className="callout callout-error" style={{ marginTop: 12, marginBottom: 0 }}>
             {ctsError}
@@ -538,66 +574,103 @@ export default function Dashboard() {
               <Icon name="download" /> All ledgers (ZIP)
             </a>
           </div>
-          <div className="batch-list">
-            {batches.map((b) => (
-              <div className="batch-item" key={b.batchNumber}>
-                {editingBatch === b.batchNumber ? (
-                  <div className="batch-edit">
-                    <input
-                      type="text"
-                      className="inline-input"
-                      value={draftTitle}
-                      autoFocus
-                      maxLength={120}
-                      placeholder="Batch title (blank = file name)"
-                      aria-label={`Title for batch ${b.batchNumber}`}
-                      onChange={(e) => setDraftTitle(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') saveRename();
-                        else if (e.key === 'Escape') cancelRename();
-                      }}
-                    />
-                    <button className="btn btn-sm" onClick={saveRename} disabled={renaming}>
-                      {renaming ? 'Saving…' : 'Save'}
-                    </button>
-                    <button className="btn btn-secondary btn-sm" onClick={cancelRename} disabled={renaming}>
-                      Cancel
-                    </button>
-                  </div>
-                ) : (
-                  <>
-                    <div className="batch-main">
-                      <div className="batch-title" title={b.batchTitle ?? `Batch ${b.batchNumber}`}>
+          <table className="batch-table">
+            <thead>
+              <tr>
+                <th>Batch</th>
+                <th>Title</th>
+                <th>Uploaded</th>
+                <th className="num">Contracts</th>
+                <th className="num">Ready</th>
+                <th>Downloads</th>
+              </tr>
+            </thead>
+            <tbody>
+              {batches.map((b) => (
+                <tr key={b.batchNumber}>
+                  <td>
+                    <strong>#{b.batchNumber}</strong>
+                  </td>
+                  {editingBatch === b.batchNumber ? (
+                    <td colSpan={5}>
+                      <div className="batch-edit">
+                        <input
+                          type="text"
+                          className="inline-input"
+                          value={draftTitle}
+                          autoFocus
+                          maxLength={120}
+                          placeholder="Batch title (blank = file name)"
+                          aria-label={`Title for batch ${b.batchNumber}`}
+                          onChange={(e) => setDraftTitle(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') saveRename();
+                            else if (e.key === 'Escape') cancelRename();
+                          }}
+                        />
+                        <button className="btn btn-sm" onClick={saveRename} disabled={renaming}>
+                          {renaming ? 'Saving…' : 'Save'}
+                        </button>
+                        <button className="btn btn-secondary btn-sm" onClick={cancelRename} disabled={renaming}>
+                          Cancel
+                        </button>
+                      </div>
+                    </td>
+                  ) : (
+                    <>
+                      <td className="batch-title-cell" title={b.batchTitle ?? `Batch ${b.batchNumber}`}>
                         {b.batchTitle ?? `Batch ${b.batchNumber}`}
-                      </div>
-                      <div className="batch-meta">
-                        Batch {b.batchNumber}
-                        {b.batchDate ? ` · ${formatBatchDate(b.batchDate)}` : ''} · {b.count} contract
-                        {b.count === 1 ? '' : 's'}
-                      </div>
-                    </div>
-                    <div className="batch-actions">
-                      <a
-                        className="btn btn-secondary btn-sm"
-                        href={allLedgersDownloadUrl(b.batchNumber)}
-                        title={`Download the ${b.count} ledger(s) in Batch ${b.batchNumber}`}
-                      >
-                        <Icon name="download" /> Ledgers
-                      </a>
-                      <button
-                        className="btn btn-secondary btn-sm btn-icon"
-                        onClick={() => startRename(b)}
-                        title={`Rename Batch ${b.batchNumber}`}
-                        aria-label={`Rename batch ${b.batchNumber}`}
-                      >
-                        <Icon name="edit" />
-                      </button>
-                    </div>
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
+                      </td>
+                      <td>{b.batchDate ? formatBatchDate(b.batchDate) : ''}</td>
+                      <td className="num">{b.count}</td>
+                      <td className="num" title={`${b.count - b.ready} still pending`}>
+                        {b.ready}
+                      </td>
+                      <td>
+                        <div className="batch-actions">
+                          <a
+                            className="btn btn-secondary btn-sm"
+                            href={allLedgersDownloadUrl(b.batchNumber)}
+                            title={`Download the ${b.count} ledger(s) in Batch ${b.batchNumber}`}
+                          >
+                            <Icon name="download" /> Ledgers
+                          </a>
+                          <a
+                            className={`btn btn-secondary btn-sm${b.ready === 0 ? ' disabled' : ''}`}
+                            href={b.ready === 0 ? undefined : batchDuplicatesUrl(b.batchNumber)}
+                            aria-disabled={b.ready === 0}
+                            title={
+                              b.ready === 0
+                                ? 'No contract in this batch is ready yet'
+                                : `One Excel file with the Duplicate tab of the ${b.ready} ready contract(s) in Batch ${b.batchNumber}`
+                            }
+                          >
+                            <Icon name="download" /> Excel (1 file)
+                          </a>
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => exportBatchStatus(b.batchNumber)}
+                            disabled={exportingBatch !== null}
+                            title={`Status of the ${b.count} contract(s) in Batch ${b.batchNumber} as an Excel file — status, analysis and every missing item`}
+                          >
+                            <Icon name="download" /> {exportingBatch === b.batchNumber ? 'Preparing…' : 'Status (Excel)'}
+                          </button>
+                          <button
+                            className="btn btn-secondary btn-sm btn-icon"
+                            onClick={() => startRename(b)}
+                            title={`Rename Batch ${b.batchNumber}`}
+                            aria-label={`Rename batch ${b.batchNumber}`}
+                          >
+                            <Icon name="edit" />
+                          </button>
+                        </div>
+                      </td>
+                    </>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
           {renameError && (
             <div className="callout callout-error" style={{ marginTop: 12, marginBottom: 0 }}>
               {renameError}
@@ -650,6 +723,14 @@ export default function Dashboard() {
             </a>
             <button className="btn btn-danger btn-sm" onClick={deleteSelected} disabled={deleting || selected.size === 0}>
               <Icon name="trash" /> {deleting ? 'Deleting…' : `Delete selected${selected.size > 0 ? ` (${selected.size})` : ''}`}
+            </button>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={exportStatus}
+              disabled={exporting || visible.length === 0}
+              title="Download the contracts shown here as an Excel file — status, analysis and every missing item"
+            >
+              <Icon name="download" /> {exporting ? 'Preparing…' : `Export status (Excel)${visible.length > 0 ? ` · ${visible.length}` : ''}`}
             </button>
             <button className="btn btn-secondary btn-sm" onClick={() => load(true)} disabled={refreshing}>
               <Icon name="refresh" /> {refreshing ? 'Refreshing…' : 'Refresh'}
@@ -789,10 +870,7 @@ export default function Dashboard() {
                               <Icon name="download" />
                             </a>
                           ) : (
-                            <span className="hint cell-ellipsis" title={a.missing.join('; ')}>
-                              {a.missing[0]}
-                              {a.missing.length > 1 ? ` +${a.missing.length - 1}` : ''}
-                            </span>
+                            <MissingItems items={a.missing} />
                           )}
                         </div>
                       );

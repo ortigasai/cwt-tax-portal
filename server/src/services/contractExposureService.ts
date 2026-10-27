@@ -7,6 +7,7 @@ import {
   computeExposure,
   ContractComputationInput,
   ExposureResult,
+  initialPaymentsExceedThreshold,
   normalizeBuyerClassification,
   normalizeTaxTagging,
   TaxTagging,
@@ -56,15 +57,75 @@ export function etbOverride(etbStartDate: Date | null): ComputationOverride {
   return { buyerClassification: 'ETB', taxTagging: 'INSTALLMENT', etbStartDate };
 }
 
+// Is this contract, although tagged Installment, really a Cash Deferred sale
+// because the 25% rule was breached in the year of the first payment? Skipped
+// when a tagging override is in force (the ETB Calculator's what-if).
+export function cashDeferredByRule(
+  contract: ContractWithRelations,
+  override?: ComputationOverride,
+): { storedTagging: TaxTagging; year: number; triggerDate: Date } | null {
+  if (override?.taxTagging) return null;
+  const { taxTagging } = deriveClassificationAndTagging(contract.collectionEvents);
+  const stored = normalizeTaxTagging(taxTagging);
+  // Only accounts the 1606 tags as Installment. An untagged account has no 1606
+  // remittances to compute penalties from, so it is left as it was.
+  if (stored !== 'INSTALLMENT') return null;
+  const check = initialPaymentsExceedThreshold(
+    contract.paymentRecords.map((p) => ({
+      paymentDate: p.paymentDate,
+      totalCollection: toNumber(p.totalCollection),
+      isSubtotal: p.isSubtotal,
+    })),
+    toNumber(contract.totalTCP),
+  );
+  return check.exceeded && check.year !== null && check.triggerDate
+    ? { storedTagging: stored, year: check.year, triggerDate: check.triggerDate }
+    : null;
+}
+
+// What the tax tagging SHOULD be, from our own reading of the payment ledger
+// (whatever the 1606 tags it as): Cash Deferred when the collections in the year
+// of the first payment exceed 25% of the Total Contract Price, otherwise
+// Installment. `triggerDate` is the payment on which the 25% was passed.
+export interface TaggingAnalysis {
+  shouldBe: 'CASH DEFERRED' | 'INSTALLMENT' | null; // null: cannot be told (no payments / no Total Contract Price)
+  firstYear: number | null;
+  triggerDate: Date | null;
+  threshold: number | null; // 25% of the Total Contract Price
+}
+
+export function analyzeTagging(contract: ContractWithRelations): TaggingAnalysis {
+  const totalTCP = toNumber(contract.totalTCP);
+  const check = initialPaymentsExceedThreshold(
+    contract.paymentRecords.map((p) => ({
+      paymentDate: p.paymentDate,
+      totalCollection: toNumber(p.totalCollection),
+      isSubtotal: p.isSubtotal,
+    })),
+    totalTCP,
+  );
+  if (totalTCP === null || totalTCP <= 0 || check.year === null) {
+    return { shouldBe: null, firstYear: null, triggerDate: null, threshold: null };
+  }
+  return {
+    shouldBe: check.exceeded ? 'CASH DEFERRED' : 'INSTALLMENT',
+    firstYear: check.year,
+    triggerDate: check.triggerDate,
+    threshold: Math.round(totalTCP * 25) / 100,
+  };
+}
+
 export function buildComputationInput(
   contract: ContractWithRelations,
   override?: ComputationOverride,
 ): ContractComputationInput {
   const { buyerClassification, taxTagging } = deriveClassificationAndTagging(contract.collectionEvents);
+  const byRule = cashDeferredByRule(contract, override);
 
   return {
     etbStartDate: override?.etbStartDate ?? null,
     netTCP: toNumber(contract.netTCP),
+    totalTCP: toNumber(contract.totalTCP),
     fmvPerTaxDeclarationUnit: contract.matchedRptRecord ? toNumber(contract.matchedRptRecord.fairMarketValue) : null,
     fmvPerTaxDeclarationParking: contract.matchedParkingRptRecord
       ? toNumber(contract.matchedParkingRptRecord.fairMarketValue)
@@ -78,7 +139,8 @@ export function buildComputationInput(
     sqmParking: toNumber(contract.sqmParking),
     sqmStorage: toNumber(contract.sqmStorage),
     buyerClassification: override?.buyerClassification ?? normalizeBuyerClassification(buyerClassification),
-    taxTagging: override?.taxTagging ?? normalizeTaxTagging(taxTagging),
+    taxTagging: byRule ? 'CASH_DEFERRED' : override?.taxTagging ?? normalizeTaxTagging(taxTagging),
+    cashDeferredByRule: byRule,
     manualDeadlineOverride: null,
     paymentRecords: contract.paymentRecords.map((p) => ({
       paymentDate: p.paymentDate,
@@ -148,16 +210,26 @@ export function deriveDisplayFields(
   override?: ComputationOverride,
 ): {
   buyerClassification: string | null;
+  // The tagging the contract is computed under (CASH DEFERRED when the 25% rule applies).
   taxTagging: string | null;
+  // The tagging as recorded on the 1606 (before the 25% rule).
+  storedTaxTagging: string | null;
+  // Set when taxTagging differs from the stored one because of the 25% rule.
+  taxTaggingNote: string | null;
   fmvPerTaxDeclarationUnit: number | null;
   fmvPerTaxDeclarationParking: number | null;
   fmvPerTaxDeclarationStorage: number | null;
   rdo: string | null;
 } {
   const { buyerClassification, taxTagging } = deriveClassificationAndTagging(contract.collectionEvents);
+  const byRule = cashDeferredByRule(contract, override);
   return {
     buyerClassification: override?.buyerClassification ?? buyerClassification,
-    taxTagging: override?.taxTagging ?? taxTagging,
+    taxTagging: byRule ? 'CASH DEFERRED' : override?.taxTagging ?? taxTagging,
+    storedTaxTagging: override?.taxTagging ?? taxTagging,
+    taxTaggingNote: byRule
+      ? `Stored as ${taxTagging ?? 'INSTALLMENT'}; collections in ${byRule.year} exceeded 25% of the Total Contract Price`
+      : null,
     fmvPerTaxDeclarationUnit: contract.matchedRptRecord ? toNumber(contract.matchedRptRecord.fairMarketValue) : null,
     fmvPerTaxDeclarationParking: contract.matchedParkingRptRecord
       ? toNumber(contract.matchedParkingRptRecord.fairMarketValue)

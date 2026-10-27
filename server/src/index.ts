@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { createApp } from './app';
 import { ensureUploadsDir } from './lib/fileStorage';
 import { getDataDir } from './services/folderSync';
+import { startDailySharePointUpdate } from './services/scheduledSharePointUpdate';
 
 ensureUploadsDir();
 
@@ -11,6 +12,7 @@ const port = Number(process.env.PORT ?? 4100);
 const server = app.listen(port, () => {
   console.log(`Pre-ONETT API listening on http://localhost:${port}`);
   console.log(`[folder-sync] watching (on demand only — no background loop): ${getDataDir()}`);
+  startDailySharePointUpdate();
 });
 
 server.on('error', (err) => {

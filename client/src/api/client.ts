@@ -72,6 +72,29 @@ export function fetchSyncStatus(): Promise<SyncStatus> {
   return request('/api/sync/status');
 }
 
+export interface DoasConnection {
+  state: 'connected' | 'signin_required' | 'unreachable';
+  sessionSet: boolean;
+  detail: string | null;
+}
+
+export function fetchDoasStatus(): Promise<DoasConnection> {
+  return request('/api/doas/status');
+}
+
+// Saves the DOAS session (a Cookie header value or a service token) and tests it.
+export function saveDoasSession(session: string): Promise<DoasConnection> {
+  return request('/api/doas/session', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session }),
+  });
+}
+
+export function clearDoasSession(): Promise<DoasConnection> {
+  return request('/api/doas/session', { method: 'DELETE' });
+}
+
 export function deleteContracts(contractNumbers: string[]): Promise<{ deleted: number }> {
   return request('/api/contracts/delete', {
     method: 'POST',
@@ -148,7 +171,7 @@ export function uploadContractList(file: File): Promise<{
 
 // ETB Calculator: computes each listed contract as if the buyer were ETB,
 // from an optional start date (YYYY-MM-DD). See server/src/routes/etb.ts.
-export function computeEtb(file: File, startDate: string): Promise<EtbComputeResponse> {
+export function computeEtb(file: File, startDate: string): Promise<{ jobId: string; total: number }> {
   const form = new FormData();
   form.append('file', file);
   if (startDate) form.append('startDate', startDate);
@@ -242,15 +265,22 @@ export function allLedgersDownloadUrl(batchNumber?: number): string {
   return `${API_URL}/api/contracts/ledgers.zip${query}`;
 }
 
+// ONE Excel file for a batch: the "Tax Payment Ledger - Duplicate" tab of every ready contract.
+export function batchDuplicatesUrl(batchNumber: number): string {
+  return `${API_URL}/api/contracts/batches/${batchNumber}/duplicates.xlsx`;
+}
+
 // ZIP of the payment ledgers of an explicit list of contracts.
 export function selectedLedgersDownloadUrl(contractNumbers: string[]): string {
   return `${API_URL}/api/contracts/ledgers.zip?contractNumbers=${encodeURIComponent(contractNumbers.join(','))}`;
 }
 
 // ZIP of the ETB variant of an explicit list of contracts' payment ledgers.
-export function etbLedgersZipUrl(contractNumbers: string[], startDate: string): string {
+export function etbLedgersZipUrl(contractNumbers: string[], startDate: string, runId?: number | null): string {
   const q = new URLSearchParams({ contractNumbers: contractNumbers.join(',') });
   if (startDate) q.set('startDate', startDate);
+  // With a run id each contract uses the start date saved on that run.
+  if (runId != null) q.set('runId', String(runId));
   return `${API_URL}/api/etb/ledgers.zip?${q.toString()}`;
 }
 
@@ -361,4 +391,62 @@ export function fetchReferenceConfig(): Promise<{
   zonalValuesFolder: string | null;
 }> {
   return request('/api/reference/config');
+}
+
+// The ETB upload template: Contract Number + Start Date of ETB, one row per contract.
+export function etbTemplateUrl(): string {
+  return `${API_URL}/api/etb/template.xlsx`;
+}
+
+// Progress (and finally the result) of a calculation started with computeEtb.
+export interface EtbJobProgress {
+  status: 'running' | 'done' | 'error';
+  stage: string;
+  done: number;
+  total: number;
+  elapsedSeconds: number;
+  result?: EtbComputeResponse;
+  error?: string;
+}
+
+export function fetchEtbJob(jobId: string): Promise<EtbJobProgress> {
+  return request(`/api/etb/jobs/${jobId}`);
+}
+
+// POSTs a JSON body to an endpoint that answers with an Excel file and saves it.
+async function downloadExcelPost(path: string, body: unknown, fallbackName: string): Promise<void> {
+  const res = await fetch(`${API_URL}${path}`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) {
+    onUnauthorized?.();
+    throw new Error('Not authenticated');
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error ?? `Export failed: ${res.status}`);
+  }
+  const blob = await res.blob();
+  const name = /filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') ?? '')?.[1] ?? fallbackName;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// The dashboard status as an Excel file (the contracts currently shown).
+export function downloadDashboardStatus(contractNumbers: string[]): Promise<void> {
+  return downloadExcelPost('/api/contracts/status.xlsx', { contractNumbers }, 'Pre-ONETT Dashboard Status.xlsx');
+}
+
+// The ETB calculation's status as an Excel file (the rows currently shown).
+export function downloadEtbStatus(runId: number, contractNumbers: string[]): Promise<void> {
+  return downloadExcelPost(`/api/etb/runs/${runId}/status.xlsx`, { contractNumbers }, 'ETB Status.xlsx');
 }

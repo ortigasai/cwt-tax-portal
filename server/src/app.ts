@@ -5,6 +5,7 @@ import { contractsRouter } from './routes/contracts';
 import { referenceRouter } from './routes/reference';
 import { zonalValuesRouter } from './routes/zonalValues';
 import { syncRouter } from './routes/sync';
+import { doasRouter } from './routes/doas';
 import { authRouter } from './routes/auth';
 import { dstTransferTaxRouter } from './routes/dstTransferTax';
 import { etbRouter } from './routes/etb';
@@ -30,6 +31,7 @@ export function createApp(): express.Express {
   app.use('/api/reference', referenceRouter);
   app.use('/api/zonal-values', zonalValuesRouter);
   app.use('/api/sync', syncRouter);
+  app.use('/api/doas', doasRouter);
   app.use('/api/dst-transfer-tax', dstTransferTaxRouter);
   app.use('/api/etb', etbRouter);
   app.use('/api/onett', onettRouter);

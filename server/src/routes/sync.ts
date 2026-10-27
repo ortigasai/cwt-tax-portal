@@ -1,12 +1,12 @@
 import { Router } from 'express';
 import { syncFromFolder, getLastSync, getDataDir } from '../services/folderSync';
-import { updateFromSharePoint } from '../services/sharepointSync';
+import { getUpdateSchedule, runSharePointUpdate } from '../services/scheduledSharePointUpdate';
 
 export const syncRouter = Router();
 
 // GET /api/sync/status — last sync result + the folder being watched.
 syncRouter.get('/status', (_req, res) => {
-  res.json({ dataDir: getDataDir(), last: getLastSync() });
+  res.json({ dataDir: getDataDir(), last: getLastSync(), schedule: getUpdateSchedule() });
 });
 
 // POST /api/sync — trigger an immediate sync. ?force=1 reloads every file even
@@ -21,9 +21,11 @@ syncRouter.post('/', async (req, res) => {
 // Value files directly from SharePoint (via the IT-issued API — see
 // sharepointApi.ts/sharepointSync.ts), then run the normal folder sync.
 // Replaces the manual "download via browser, drop in the folder" workflow.
+// The same update also runs by itself every day at 10:00 AM (see
+// scheduledSharePointUpdate.ts); a click during that run joins it.
 syncRouter.post('/from-sharepoint', async (_req, res) => {
   try {
-    const summary = await updateFromSharePoint();
+    const summary = await runSharePointUpdate('manual');
     res.json(summary);
   } catch (err) {
     res.status(502).json({ error: (err as Error).message });

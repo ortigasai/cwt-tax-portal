@@ -1,9 +1,10 @@
 import { Fragment, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { etbLedgerDownloadUrl, etbLedgersZipUrl } from '../api/client';
+import { downloadEtbStatus, etbLedgerDownloadUrl, etbLedgersZipUrl } from '../api/client';
 import type { EtbContractResult, ExposureStatus } from '../api/types';
 import { formatCurrency, formatDate } from '../utils/format';
 import StatusBadge from './StatusBadge';
+import MissingItems from './MissingItems';
 import Icon from './Icon';
 
 // The results of one ETB calculation — summary tiles, search/filter, bulk
@@ -28,16 +29,20 @@ const FILTERS: { value: StatusFilter; label: string }[] = [
 ];
 
 interface Props {
+  // The run's default start date (rows without their own date use it).
   startDate: string | null;
+  // The saved run, so the ZIP download uses each contract's own start date.
+  runId?: number | null;
   results: EtbContractResult[];
   errors?: string[];
 }
 
-export default function EtbResultsView({ startDate, results, errors = [] }: Props) {
+export default function EtbResultsView({ startDate, runId = null, results, errors = [] }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
+  const [exporting, setExporting] = useState(false);
 
   const isReady = (r: EtbContractResult) => r.analysis.state !== 'PENDING';
 
@@ -62,6 +67,14 @@ export default function EtbResultsView({ startDate, results, errors = [] }: Prop
     }
     return c;
   }, [results]);
+
+  const exportStatus = () => {
+    if (runId == null) return;
+    setExporting(true);
+    downloadEtbStatus(runId, visible.map((r) => r.contractNumber))
+      .catch((e: Error) => window.alert(`Could not export: ${e.message}`))
+      .finally(() => setExporting(false));
+  };
 
   const readyNumbers = visible.filter(isReady).map((r) => r.contractNumber);
   const pickedReady = visible.filter((r) => picked.has(r.contractNumber) && isReady(r)).map((r) => r.contractNumber);
@@ -152,7 +165,7 @@ export default function EtbResultsView({ startDate, results, errors = [] }: Prop
       <div className="btn-row" style={{ margin: '12px 0' }}>
         <a
           className={`btn btn-secondary btn-sm${readyNumbers.length === 0 ? ' disabled' : ''}`}
-          href={readyNumbers.length === 0 ? undefined : etbLedgersZipUrl(readyNumbers, startDate ?? '')}
+          href={readyNumbers.length === 0 ? undefined : etbLedgersZipUrl(readyNumbers, startDate ?? '', runId)}
           aria-disabled={readyNumbers.length === 0}
           title="One ZIP with the ETB payment ledger of every contract shown whose analysis is done"
         >
@@ -160,12 +173,24 @@ export default function EtbResultsView({ startDate, results, errors = [] }: Prop
         </a>
         <a
           className={`btn btn-secondary btn-sm${pickedReady.length === 0 ? ' disabled' : ''}`}
-          href={pickedReady.length === 0 ? undefined : etbLedgersZipUrl(pickedReady, startDate ?? '')}
+          href={pickedReady.length === 0 ? undefined : etbLedgersZipUrl(pickedReady, startDate ?? '', runId)}
           aria-disabled={pickedReady.length === 0}
           title="Tick contracts below, then download just those"
         >
           <Icon name="download" /> Download selected (ZIP){pickedReady.length > 0 ? ` · ${pickedReady.length}` : ''}
         </a>
+        <button
+          className="btn btn-secondary btn-sm"
+          onClick={exportStatus}
+          disabled={exporting || runId == null || visible.length === 0}
+          title={
+            runId == null
+              ? 'Open this calculation from the ETB Dashboard to export it'
+              : 'Download the rows shown here as an Excel file — ETB start date, status, analysis and every missing item'
+          }
+        >
+          <Icon name="download" /> {exporting ? 'Preparing…' : `Export status (Excel)${visible.length > 0 ? ` · ${visible.length}` : ''}`}
+        </button>
         {results.length - readyAll > 0 && (
           <span className="hint">
             {results.length - readyAll} contract(s) still pending — hover their Analysis badge to see what is missing.
@@ -194,6 +219,7 @@ export default function EtbResultsView({ startDate, results, errors = [] }: Prop
               <th>Contract No.</th>
               <th>Buyer's Name</th>
               <th>Stored as</th>
+              <th>ETB start</th>
               <th>CTS notary</th>
               <th className="num">Tax base</th>
               <th className="num">CWT due</th>
@@ -239,6 +265,7 @@ export default function EtbResultsView({ startDate, results, errors = [] }: Prop
                       {r.storedClassification ?? '—'}
                       {r.taxTagging ? ` · ${r.taxTagging}` : ''}
                     </td>
+                    <td>{r.startDate ? formatDate(r.startDate) : 'All payments'}</td>
                     <td>{formatDate(r.ctsNotaryDate)}</td>
                     <td className="num">
                       {formatCurrency(r.cwtTaxBase)}
@@ -274,17 +301,14 @@ export default function EtbResultsView({ startDate, results, errors = [] }: Prop
                         {isReady(r) ? (
                           <a
                             className="btn btn-ghost btn-sm"
-                            href={etbLedgerDownloadUrl(r.contractNumber, startDate ?? '')}
+                            href={etbLedgerDownloadUrl(r.contractNumber, r.startDate ?? '')}
                             aria-label={`Download ETB payment ledger for ${r.contractNumber}`}
                             title="Download this contract's ETB payment ledger (Excel)"
                           >
                             <Icon name="download" />
                           </a>
                         ) : (
-                          <span className="hint cell-ellipsis" title={r.analysis.missing.join('; ')}>
-                            {r.analysis.missing[0]}
-                            {r.analysis.missing.length > 1 ? ` +${r.analysis.missing.length - 1}` : ''}
-                          </span>
+                          <MissingItems items={r.analysis.missing} />
                         )}
                       </div>
                     </td>
@@ -293,10 +317,10 @@ export default function EtbResultsView({ startDate, results, errors = [] }: Prop
                     <tr>
                       <td />
                       <td />
-                      <td colSpan={11}>
+                      <td colSpan={12}>
                         <p className="hint" style={{ marginTop: 0 }}>
                           {r.deadlineNote}
-                          {startDate && r.paymentsBeforeStart > 0
+                          {r.startDate && r.paymentsBeforeStart > 0
                             ? ` ${r.paymentsBeforeStart} of ${r.paymentCount} payment(s) fall before the start date and carry no ETB obligation.`
                             : ''}
                           {r.taxTagging !== 'INSTALLMENT'
@@ -352,7 +376,7 @@ export default function EtbResultsView({ startDate, results, errors = [] }: Prop
                           );
                         })()}
                         <div className="btn-row" style={{ marginTop: 10 }}>
-                          <a className="btn btn-secondary btn-sm" href={etbLedgerDownloadUrl(r.contractNumber, startDate ?? '')}>
+                          <a className="btn btn-secondary btn-sm" href={etbLedgerDownloadUrl(r.contractNumber, r.startDate ?? '')}>
                             <Icon name="download" /> Download ETB ledger (Excel)
                           </a>
                         </div>

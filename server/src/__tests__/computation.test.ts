@@ -11,6 +11,7 @@ import {
 
 const baseInput = (overrides: Partial<ContractComputationInput> = {}): ContractComputationInput => ({
   netTCP: 1_000_000,
+  totalTCP: 1_120_000,
   fmvPerTaxDeclarationUnit: 900_000,
   fmvPerTaxDeclarationParking: null,
   fmvPerTaxDeclarationStorage: null,
@@ -119,7 +120,8 @@ describe('computeDeadline', () => {
       ],
     });
     const result = computeDeadline(input);
-    expect(result.primaryDeadline?.toISOString().slice(0, 10)).toBe('2023-06-10');
+    // 2023-06-10 is a Saturday and Monday 06-12 is Independence Day -> next business day is 06-13.
+    expect(result.primaryDeadline?.toISOString().slice(0, 10)).toBe('2023-06-13');
   });
 
   it('ETB + Installment: one deadline per payment, primary is earliest', () => {
@@ -151,7 +153,7 @@ describe('computeDeadline', () => {
       paymentRecords: records,
     });
     const result = computeDeadline(withStart);
-    expect(result.entries.map((e) => e.date.toISOString().slice(0, 10))).toEqual(['2023-03-10', '2023-04-10']);
+    expect(result.entries.map((e) => e.date.toISOString().slice(0, 10))).toEqual(['2023-03-10', '2023-04-11']); // Apr 10, 2023 was a holiday (Proc. 90)
     expect(result.primaryDeadline?.toISOString().slice(0, 10)).toBe('2023-03-10');
     expect(result.note).toContain('ETB start date (02/15/2023)');
 
@@ -540,7 +542,7 @@ describe('computeDeadline', () => {
     expect(result.entries[1].basisAmount).toBe(226.56); // recorded principal 4,531.25 * 5% — NOT combined with row 1
     expect(result.entries[1].date.toISOString().slice(0, 10)).toBe('2023-03-10');
     expect(result.entries[2].basisAmount).toBe(360.49); // (8,075 / 1.12) * 5%
-    expect(result.entries[2].date.toISOString().slice(0, 10)).toBe('2023-04-10');
+    expect(result.entries[2].date.toISOString().slice(0, 10)).toBe('2023-04-11'); // Apr 10, 2023 was a holiday (Proc. 90)
     for (const e of result.entries) expect(e.description).not.toContain('reservation fee');
   });
 
@@ -644,7 +646,7 @@ describe('computeDeadline', () => {
     expect(result.entries[0].basisAmount).toBe(1116.07); // (25,000 / 1.12) * 5%
   });
 
-  it('Cash Deferred: triggers on payment where cumulative exceeds 25% of Net TCP', () => {
+  it('Cash Deferred: triggers on payment where cumulative exceeds 25% of the Total Contract Price', () => {
     const input = baseInput({
       buyerClassification: 'CORPORATION',
       taxTagging: 'CASH_DEFERRED',
@@ -657,7 +659,7 @@ describe('computeDeadline', () => {
       ],
     });
     const result = computeDeadline(input);
-    expect(result.primaryDeadline?.toISOString().slice(0, 10)).toBe('2023-04-10');
+    expect(result.primaryDeadline?.toISOString().slice(0, 10)).toBe('2023-04-11'); // Apr 10, 2023 was a holiday (Proc. 90)
   });
 
   it('Cash Deferred: no deadline when threshold never crossed', () => {
@@ -779,6 +781,7 @@ describe('computeExposure', () => {
       taxTagging: 'CASH_DEFERRED',
       buyerClassification: 'CORPORATION',
       netTCP: 100000,
+      totalTCP: 112000,
       fmvPerTaxDeclarationUnit: null,
       fmvPerTaxDeclarationParking: null,
       fmvPerTaxDeclarationStorage: null,
@@ -855,7 +858,8 @@ describe('computePerPaymentLines', () => {
     expect(lines[0].shouldBeCwtDue).toBeNull();
     expect(lines[0].applicableDeadline).toBeNull();
     expect(lines[1].shouldBeCwtDue).toBe(4017.86); // 1,785.76 + 2,232.10
-    expect(lines[1].applicableDeadline?.toISOString().slice(0, 10)).toBe('2020-04-10');
+    // 2020-04-10 is Good Friday (and Sat/Sun follow) -> Monday 2020-04-13.
+    expect(lines[1].applicableDeadline?.toISOString().slice(0, 10)).toBe('2020-04-13');
   });
 
   it('Individual + Installment: only the triggering (last) payment carries the due; others have no obligation', () => {
@@ -1076,7 +1080,8 @@ describe('computePerPaymentLines', () => {
       });
       const deadline = computeDeadline(input);
       const lines = computePerPaymentLines(input, deadline, 360.49, new Date('2025-01-01'));
-      expect(lines[0].applicableDeadline?.toISOString().slice(0, 10)).toBe('2021-10-10');
+      // 2021-10-10 is a Sunday -> due Monday 2021-10-11.
+      expect(lines[0].applicableDeadline?.toISOString().slice(0, 10)).toBe('2021-10-11');
       expect(lines[0].remittedInDeadlineMonth).toBe(true);
     });
 
@@ -1142,8 +1147,9 @@ describe('computePerPaymentLines', () => {
         collectionEvents: [], // nothing remitted -> full should-be due is exposure
       });
       const deadline = computeDeadline(input);
-      // Deadline is 2021-10-10; asOfDate is exactly 365 days later (post-2018 -> 12% rate).
-      const lines = computePerPaymentLines(input, deadline, 360.49, new Date('2022-10-10'));
+      // The 10th (2021-10-10) is a Sunday, so the deadline is Monday 2021-10-11; asOfDate is
+      // exactly 365 days after that (post-2018 -> 12% rate).
+      const lines = computePerPaymentLines(input, deadline, 360.49, new Date('2022-10-11'));
       const line = lines[0];
       expect(line.difference).toBe(360.49);
       expect(line.penalties).not.toBeNull();
@@ -1194,7 +1200,8 @@ describe('computePerPaymentLines', () => {
       const lines = computePerPaymentLines(input, deadline, 4690.85, new Date('2025-01-01'));
       expect(lines[0].cwtFileTaxDue).toBe(50); // matched (last/only row in May 2018)
       expect(lines[0].shouldBeCwtDue).toBe(4464.29); // (100,000 / 1.12) * 5%
-      expect(lines[0].applicableDeadline?.toISOString().slice(0, 10)).toBe('2018-06-10');
+      // 2018-06-10 is a Sunday -> due Monday 2018-06-11.
+      expect(lines[0].applicableDeadline?.toISOString().slice(0, 10)).toBe('2018-06-11');
       expect(lines[0].difference).toBe(4414.29); // 4,464.29 - 50 remitted
       expect(lines[0].penalties).not.toBeNull();
       expect(lines[0].totalDue).toBe(round2(4414.29 + lines[0].penalties!.totalPenalties));

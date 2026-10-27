@@ -858,6 +858,25 @@ input[type='file']::file-selector-button:hover {
   flex: none;
 }
 
+/* Upload-batches table (Dashboard): the title takes the spare width, the
+   downloads stay on one row. */
+.batch-table .batch-title-cell {
+  width: 100%;
+  max-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+
+.batch-table th.num,
+.batch-table td.num {
+  text-align: right;
+}
+
+.batch-table .batch-actions {
+  flex-wrap: nowrap;
+}
+
 .batch-edit {
   display: flex;
   align-items: center;
@@ -1059,4 +1078,21 @@ input[type='file']::file-selector-button:hover {
   .search-wrap {
     max-width: none;
   }
+}
+
+/* Everything still needed for a pending contract, one item per line. */
+.missing-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--text-muted);
+}
+.missing-list li::before {
+  content: '• ';
+  color: var(--danger);
 }

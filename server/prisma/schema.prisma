@@ -192,6 +192,9 @@ model EtbRun {
   filename        String
   startDate       DateTime?
   contractNumbers String[]
+  // Per-contract ETB start dates from the uploaded list ({ contractNumber: "YYYY-MM-DD" });
+  // a contract without an entry uses startDate above (the run's default).
+  contractStarts  Json      @default("{}")
   createdAt       DateTime  @default(now())
 }
 

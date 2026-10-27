@@ -10,6 +10,7 @@ import OnettUploadPage from './pages/OnettUploadPage';
 import ReferenceDataPage from './pages/ReferenceDataPage';
 import DstTransferTaxPage from './pages/DstTransferTaxPage';
 import LoginPage from './pages/LoginPage';
+import { EtbJobProvider, useEtbJob } from './etbJob';
 import Icon from './components/Icon';
 import { checkAuth, logout, setUnauthorizedHandler } from './api/client';
 
@@ -19,6 +20,20 @@ import { checkAuth, logout, setUnauthorizedHandler } from './api/client';
 const DST_TRANSFER_TAX_PREFIX = '/dst-transfer-tax';
 const ETB_PREFIX = '/etb';
 const ONETT_PREFIX = '/onett';
+
+// A small "calculating" dot on the ETB tab while a calculation is running.
+function EtbBusyDot() {
+  const { job } = useEtbJob();
+  if (job.status === 'running') {
+    return (
+      <span title={`${job.stage}: ${job.done} of ${job.total}`} style={{ marginLeft: 6, fontSize: 12 }}>
+        <span className="spinner" aria-label="ETB calculation running" /> {job.done}/{job.total}
+      </span>
+    );
+  }
+  if (job.status === 'done') return <span aria-label="ETB calculation finished" style={{ marginLeft: 6 }}>●</span>;
+  return null;
+}
 
 function App() {
   const [authState, setAuthState] = useState<'checking' | 'in' | 'out'>('checking');
@@ -49,6 +64,7 @@ function App() {
   const inCwtModule = !inDstModule && !inEtbModule && !inOnettModule;
 
   return (
+    <EtbJobProvider>
     <div className="app-shell">
       <header className="app-header">
         <div className="app-brand">
@@ -61,6 +77,7 @@ function App() {
           </Link>
           <Link to={ETB_PREFIX} className={inEtbModule ? 'active' : undefined}>
             ETB Calculator
+            <EtbBusyDot />
           </Link>
           <Link to={ONETT_PREFIX} className={inOnettModule ? 'active' : undefined}>
             ONETT Summary
@@ -121,6 +138,7 @@ function App() {
         </Routes>
       </main>
     </div>
+    </EtbJobProvider>
   );
 }
 

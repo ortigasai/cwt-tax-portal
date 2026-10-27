@@ -7,7 +7,8 @@
 // GET-only against <DOAS_API_URL>/api/ledgerfit/sessions; best effort — every
 // failure just means "no session info".
 
-const BASE_URL = (process.env.DOAS_API_URL ?? 'http://192.168.16.239:4100').replace(/\/+$/, '');
+import { doasFetch } from './doasAuth';
+
 const TIMEOUT_MS = 30_000;
 const TTL_MS = 2 * 60_000;
 
@@ -34,7 +35,7 @@ let cache: { at: number; byContract: Map<string, LedgerfitSessionInfo> } | null 
 
 async function loadSessions(): Promise<Map<string, LedgerfitSessionInfo>> {
   if (cache && Date.now() - cache.at < TTL_MS) return cache.byContract;
-  const res = await fetch(`${BASE_URL}/api/ledgerfit/sessions`, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  const res = await doasFetch('/api/ledgerfit/sessions', TIMEOUT_MS);
   if (!res.ok) throw new Error(`LedgerFit sessions → HTTP ${res.status}`);
   const body = (await res.json()) as { rows: SessionRow[] };
 

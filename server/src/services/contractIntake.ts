@@ -58,11 +58,49 @@ export interface IntakeSummary {
   errors: string[];
 }
 
-export async function retrieveDataForContracts(contractNumbers: string[]): Promise<IntakeSummary> {
+export interface IntakeProgress {
+  stage: string;
+  done: number;
+  total: number;
+}
+
+// Contracts are processed in small groups so a progress callback can report
+// "N of M" — one at a time for lists up to 30, larger groups beyond that.
+function chunksOf<T>(items: T[]): T[][] {
+  const size = Math.max(1, Math.ceil(items.length / 30));
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+export async function retrieveDataForContracts(
+  contractNumbers: string[],
+  onProgress?: (p: IntakeProgress) => void,
+): Promise<IntakeSummary> {
   const errors: string[] = [];
+  const total = contractNumbers.length;
+  const report = (stage: string, done: number, of = total) => onProgress?.({ stage, done, total: of });
 
   // 1. Ledgers.
-  const ledgers = await fetchLedgersForContracts(contractNumbers);
+  const ledgers: Awaited<ReturnType<typeof fetchLedgersForContracts>> = {
+    loaded: [],
+    fromReviewed: [],
+    notFound: [],
+    notLatest: [],
+    errors: [],
+  };
+  let processed = 0;
+  report('Loading payment ledgers', 0);
+  for (const group of chunksOf(contractNumbers)) {
+    const part = await fetchLedgersForContracts(group);
+    ledgers.loaded.push(...part.loaded);
+    ledgers.fromReviewed.push(...part.fromReviewed);
+    ledgers.notFound.push(...part.notFound);
+    ledgers.notLatest.push(...part.notLatest);
+    ledgers.errors.push(...part.errors);
+    processed += group.length;
+    report('Loading payment ledgers', processed);
+  }
   errors.push(...ledgers.errors);
   const ledgersNotFoundAdvice: { contractNumber: string; advice: string }[] = [];
   for (const n of ledgers.notFound) {
@@ -86,6 +124,7 @@ export async function retrieveDataForContracts(contractNumbers: string[]): Promi
   }
 
   // 2. 1606 Summary.
+  report('Updating the 1606 Summary', 0, 1);
   const oclp: IntakeSummary['oclp'] = { refreshedFromSharePoint: false, matchedRows: null };
   try {
     const pull = await pullOclpFromSharePoint();
@@ -106,7 +145,16 @@ export async function retrieveDataForContracts(contractNumbers: string[]): Promi
   }
 
   // 3. CTS.
-  const cts = await attachCtsFromSharePoint(contractNumbers);
+  report('Attaching CTS files', 0);
+  const cts: { fetched: string[]; errors: string[] } = { fetched: [], errors: [] };
+  processed = 0;
+  for (const group of chunksOf(contractNumbers)) {
+    const part = await attachCtsFromSharePoint(group);
+    cts.fetched.push(...part.fetched);
+    cts.errors.push(...part.errors);
+    processed += group.length;
+    report('Attaching CTS files', processed);
+  }
   errors.push(...cts.errors);
   const withCts = await prisma.contract.findMany({
     where: { contractNumber: { in: contractNumbers }, ctsFileName: { not: null } },
@@ -115,6 +163,7 @@ export async function retrieveDataForContracts(contractNumbers: string[]): Promi
 
   // 4. CTS notary date / SQM / zonal value — from the DOAS batches, since the
   // CTS PDFs are scans with no readable text. Fills empty fields only.
+  report('Reading CTS notary date and SQM from DOAS', 0, 1);
   const ctsData = await fillCtsDataForContracts(contractNumbers);
   errors.push(...ctsData.errors);
   const withNotary = await prisma.contract.findMany({

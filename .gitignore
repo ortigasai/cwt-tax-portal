@@ -20,3 +20,4 @@ deploy/_migration-output/
 # data, not source code. Moved between machines via deploy/migrate-data.ps1
 # instead (ensureUploadsDir() recreates this folder on server startup).
 server/uploads/
+server/doas-session.json

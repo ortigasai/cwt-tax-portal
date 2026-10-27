@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { deleteEtbRun, fetchEtbRun, fetchEtbRuns, renameEtbRun } from '../api/client';
+import { useEtbJob } from '../etbJob';
+import EtbProgress from '../components/EtbProgress';
 import type { EtbRunDetail, EtbRunSummary } from '../api/types';
 import { formatDate } from '../utils/format';
 import EtbResultsView from '../components/EtbResultsView';
@@ -13,6 +15,7 @@ function formatRunDate(iso: string): string {
 
 export default function EtbDashboardPage() {
   const [params, setParams] = useSearchParams();
+  const { job, dismiss } = useEtbJob();
   const [runs, setRuns] = useState<EtbRunSummary[] | null>(null);
   const [detail, setDetail] = useState<EtbRunDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -36,6 +39,11 @@ export default function EtbDashboardPage() {
   useEffect(() => {
     void loadRuns();
   }, []);
+
+  // A calculation that finished while this page was open (or just before) is a new run.
+  useEffect(() => {
+    if (job.status === 'done') void loadRuns();
+  }, [job.status]);
 
   // The run being looked at: the one in the URL, else the newest.
   const activeId = selectedId ?? runs?.[0]?.id ?? null;
@@ -112,6 +120,38 @@ export default function EtbDashboardPage() {
         </div>
       </div>
 
+      {job.status === 'running' && (
+        <div className="callout callout-info">
+          <div style={{ marginBottom: 6 }}>
+            <span className="spinner" /> Calculating “{job.fileName}” — it keeps running while you browse; the result
+            appears here as a new calculation when it is done.{' '}
+            <Link to="/etb/calculator">Watch it</Link>
+          </div>
+          <EtbProgress job={job} />
+        </div>
+      )}
+      {job.status === 'done' && job.result && (
+        <div className="callout callout-success">
+          “{job.fileName}” finished — {job.result.totalFound} contract(s) computed.{' '}
+          {job.result.runId != null && (
+            <Link to={`/etb?run=${job.result.runId}`} onClick={dismiss}>
+              Open the results
+            </Link>
+          )}{' '}
+          <button className="btn btn-ghost btn-sm" onClick={dismiss}>
+            Dismiss
+          </button>
+        </div>
+      )}
+      {job.status === 'error' && (
+        <div className="callout callout-error">
+          Calculation of “{job.fileName}” failed: {job.error}{' '}
+          <button className="btn btn-ghost btn-sm" onClick={dismiss}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {error && <div className="callout callout-error">{error}</div>}
 
       {runs && runs.length === 0 && (
@@ -164,7 +204,11 @@ export default function EtbDashboardPage() {
                       </div>
                       <div className="batch-meta">
                         {formatRunDate(r.createdAt)} · {r.contractCount} contract{r.contractCount === 1 ? '' : 's'} ·{' '}
-                        {r.startDate ? `ETB from ${formatDate(r.startDate)}` : 'all payments as ETB'}
+                        {r.perContractStarts > 0
+                          ? `${r.perContractStarts} with their own start date${r.startDate ? ` · others from ${formatDate(r.startDate)}` : ''}`
+                          : r.startDate
+                            ? `ETB from ${formatDate(r.startDate)}`
+                            : 'all payments as ETB'}
                       </div>
                     </div>
                     <div className="batch-actions">
@@ -215,7 +259,11 @@ export default function EtbDashboardPage() {
             <div>
               <h3 className="card-title">{detail.run.title}</h3>
               <p className="card-subtitle">
-                {detail.startDate ? `ETB treatment from ${formatDate(detail.startDate)}` : 'Every payment treated as ETB'}
+                {detail.run.perContractStarts > 0
+                  ? `Start date per contract (${detail.run.perContractStarts} listed)${detail.startDate ? `, others from ${formatDate(detail.startDate)}` : ''}`
+                  : detail.startDate
+                    ? `ETB treatment from ${formatDate(detail.startDate)}`
+                    : 'Every payment treated as ETB'}
                 {' · '}
                 {detail.results.length} contract{detail.results.length === 1 ? '' : 's'}
                 {detail.missing.length > 0 ? ` · ${detail.missing.length} no longer in the portal` : ''}
@@ -229,7 +277,7 @@ export default function EtbDashboardPage() {
               {detail.missing.length > 10 ? ', …' : ''}.
             </div>
           )}
-          <EtbResultsView startDate={detail.startDate} results={detail.results} />
+          <EtbResultsView startDate={detail.startDate} runId={detail.run.id} results={detail.results} />
         </div>
       )}
     </div>

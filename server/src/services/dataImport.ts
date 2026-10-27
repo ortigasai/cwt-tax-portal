@@ -1,6 +1,6 @@
 import { prisma } from '../lib/prisma';
 import { parseCustomerLedger } from '../parsers/customerLedgerParser';
-import { parseOclp1606Summary } from '../parsers/oclp1606Parser';
+import { Oclp1606Row, parseOclp1606Workbook } from '../parsers/oclp1606Parser';
 
 // Shared import logic used by both the HTTP upload routes and the automatic
 // folder sync, so there is a single source of truth for how a Customer Ledger
@@ -40,32 +40,60 @@ export async function importCustomerLedgerBuffer(
   return { ok: true, paymentRecordsImported: parsed.paymentRecords.length };
 }
 
+// Links 1606 rows to our contracts.
+//
+// A unit's buyer (and contract number) can change mid-payment; the 1606 file's
+// "Base contract" column anchors every remittance for that unit's lineage to one
+// stable number, regardless of which buyer's contract number a given row was
+// actually filed under. For each of our contracts the Base contract is looked up
+// FIRST in the FINAL tab (the base on rows filed under its own number); only when
+// FINAL has no row for it do we use the "Contracts - look up" tab (contract
+// number -> Base Contract). Then every FINAL row on that Base contract — filed
+// under a previous buyer's number, say — is attributed to the contract, so the
+// remittances made under a previous buyer still count.
+export function buildRowLinker(
+  rows: Pick<Oclp1606Row, 'contractNumberRaw' | 'baseContract'>[],
+  baseLookup: Map<string, string>,
+  contractByNumber: Map<string, string>,
+) {
+  const baseOfContract = new Map<string, string>();
+  for (const row of rows) {
+    if (contractByNumber.has(row.contractNumberRaw) && row.baseContract && !baseOfContract.has(row.contractNumberRaw)) {
+      baseOfContract.set(row.contractNumberRaw, row.baseContract);
+    }
+  }
+  for (const contractNumber of contractByNumber.keys()) {
+    if (baseOfContract.has(contractNumber)) continue;
+    const viaLookup = baseLookup.get(contractNumber);
+    if (viaLookup) baseOfContract.set(contractNumber, viaLookup);
+  }
+  const contractIdByBaseContract = new Map<string, string>();
+  for (const [contractNumber, base] of baseOfContract) {
+    contractIdByBaseContract.set(base, contractByNumber.get(contractNumber)!);
+  }
+
+  // A row's own Base contract, else the look-up tab's entry for its contract number.
+  const rowBase = (row: Pick<Oclp1606Row, 'contractNumberRaw' | 'baseContract'>): string | null =>
+    row.baseContract ?? baseLookup.get(row.contractNumberRaw) ?? null;
+
+  const resolveContractId = (row: Pick<Oclp1606Row, 'contractNumberRaw' | 'baseContract'>): string | null => {
+    const direct = contractByNumber.get(row.contractNumberRaw);
+    if (direct) return direct;
+    const base = rowBase(row);
+    return (base ? contractIdByBaseContract.get(base) : undefined) ?? null;
+  };
+
+  return { resolveContractId, rowBase };
+}
+
 export async function importOclp1606File(
   filePath: string,
   filename: string,
 ): Promise<{ totalRows: number; matchedRows: number; unmatchedRows: number; contractsUpdated: number }> {
-  const rows = await parseOclp1606Summary(filePath);
+  const { rows, baseLookup } = await parseOclp1606Workbook(filePath);
   const contracts = await prisma.contract.findMany({ select: { id: true, contractNumber: true } });
   const contractByNumber = new Map(contracts.map((c) => [c.contractNumber, c.id]));
-
-  // A unit's buyer (and contract number) can change mid-payment; the 1606
-  // file's "Base contract" column anchors every remittance for that unit's
-  // lineage to one stable number, regardless of which buyer's contract
-  // number a given row was actually filed under. First pass: find, for each
-  // Base contract value, which of our contracts it belongs to — from rows
-  // that directly match a known contract number. Second pass: any row that
-  // doesn't directly match (e.g. filed under a since-superseded contract
-  // number) falls back to that Base-contract-derived link, so remittances
-  // made under a previous buyer still attribute to the current contract.
-  const contractIdByBaseContract = new Map<string, string>();
-  for (const row of rows) {
-    const directId = contractByNumber.get(row.contractNumberRaw);
-    if (directId && row.baseContract) contractIdByBaseContract.set(row.baseContract, directId);
-  }
-
-  function resolveContractId(row: (typeof rows)[number]): string | null {
-    return contractByNumber.get(row.contractNumberRaw) ?? (row.baseContract ? contractIdByBaseContract.get(row.baseContract) : undefined) ?? null;
-  }
+  const { resolveContractId, rowBase } = buildRowLinker(rows, baseLookup, contractByNumber);
 
   let matched = 0;
   let unmatched = 0;
@@ -90,7 +118,7 @@ export async function importOclp1606File(
     data: rows.map((row) => ({
       contractId: resolveContractId(row),
       contractNumberRaw: row.contractNumberRaw,
-      baseContract: row.baseContract,
+      baseContract: rowBase(row),
       buyerClassification: row.buyerClassification,
       taxTagging: row.taxTagging,
       sourceTaxBase: row.sourceTaxBase,

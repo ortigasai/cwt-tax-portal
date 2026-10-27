@@ -20,6 +20,14 @@ export interface SyncSummary {
 export interface SyncStatus {
   dataDir: string;
   last: SyncSummary | null;
+  // The automatic daily "Update from SharePoint".
+  schedule?: {
+    enabled: boolean;
+    hour: number;
+    nextRunAt: string | null;
+    running: boolean;
+    lastRun: { trigger: 'scheduled' | 'manual'; startedAt: string; finishedAt: string; ok: boolean; error: string | null } | null;
+  };
 }
 
 // What uploading a contract list retrieved, for just those contracts.
@@ -66,6 +74,8 @@ export interface AnalysisState {
 
 export interface EtbContractResult {
   contractNumber: string;
+  // The ETB start date this contract was computed with (its own, else the run's default).
+  startDate: string | null;
   analysis: AnalysisState;
   buyerName: string | null;
   tower: string | null;
@@ -97,6 +107,8 @@ export interface EtbRunSummary {
   filename: string;
   startDate: string | null;
   contractCount: number;
+  // How many contracts have their own start date in the uploaded list.
+  perContractStarts: number;
   createdAt: string;
 }
 
@@ -112,6 +124,7 @@ export interface EtbComputeResponse {
   runId?: number;
   runTitle?: string;
   startDate: string | null;
+  perContractStarts?: number;
   totalFound: number;
   created: number;
   retrievedFor: number;
